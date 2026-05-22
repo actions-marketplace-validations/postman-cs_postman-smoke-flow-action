@@ -247,4 +247,65 @@ describe('collection transform', () => {
 
     expect(request.url).toBe('{{baseUrl}}/v1/providers/{providerId}/alternates?providerId=prov-123&use-care-team=true');
   });
+
+  it('adds optional OAuth token caching and bearer headers without serializing secrets', () => {
+    const result = buildCuratedSmokeCollection(
+      { info: { name: '[Smoke][Temp] Payments API' }, item: [] },
+      flow,
+      [
+        {
+          step: flow.steps[0]!,
+          item: {
+            name: 'createPayment',
+            request: {
+              method: 'POST',
+              header: [{ key: 'Authorization', value: 'Bearer old-token' }],
+              url: 'https://api.example.com/payments'
+            }
+          }
+        }
+      ],
+      {
+        enabled: true,
+        type: 'oauth2',
+        grantType: 'client_credentials',
+        tokenUrl: '{{auth_token_url}}',
+        clientAuthentication: 'body',
+        request: {
+          contentType: 'application/x-www-form-urlencoded'
+        },
+        variables: {
+          tokenUrl: 'auth_token_url',
+          scope: 'auth_scope',
+          clientId: 'auth_client_id',
+          clientSecret: 'auth_client_secret',
+          accessToken: 'access_token',
+          expiresAt: 'access_token_expires_at'
+        },
+        cache: {
+          refreshSkewSeconds: 60
+        },
+        apply: {
+          header: 'Authorization',
+          value: 'Bearer {{access_token}}'
+        }
+      }
+    );
+
+    const collectionText = JSON.stringify(result.collection);
+    const events = result.collection.event as Array<Record<string, unknown>>;
+    const items = result.collection.item as Array<Record<string, unknown>>;
+    const request = (items[1] as Record<string, unknown>).request as Record<string, unknown>;
+    const headers = request.header as Array<Record<string, unknown>>;
+
+    expect(events).toHaveLength(1);
+    expect(collectionText).toContain('pm.variables.set(accessTokenVariable, accessToken)');
+    expect(collectionText).toContain('pm.variables.set(expiresAtVariable');
+    expect(collectionText).not.toContain('pm.environment.set');
+    expect(headers.filter((header) => header.key === 'Authorization')).toEqual([
+      { key: 'Authorization', value: 'Bearer {{access_token}}' }
+    ]);
+    expect(collectionText).not.toContain('super-secret');
+    expect(collectionText).not.toContain('real-access-token');
+  });
 });
