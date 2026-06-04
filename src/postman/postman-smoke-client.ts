@@ -12,11 +12,20 @@ function asRecord(value: unknown): JsonRecord | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonRecord) : null;
 }
 
+function isDeepUpdateConflict(error: unknown): boolean {
+  if (!(error instanceof HttpError) || error.status !== 409) {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return message.includes('deepupdate') || message.includes('currently being modified');
+}
+
 export class PostmanSmokeClient {
   constructor(
     private readonly apiKey: string,
     private readonly baseUrl = 'https://api.getpostman.com',
-    private readonly fetchImpl: typeof fetch = fetch
+    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly sleepImpl: (ms: number) => Promise<void> = sleep
   ) {}
 
   private async request(path: string, init: RequestInit = {}): Promise<JsonRecord | null> {
@@ -80,7 +89,7 @@ export class PostmanSmokeClient {
         if (!isLocked || lockedAttempt >= maxLockedRetries) {
           throw error;
         }
-        await sleep(5000 * Math.pow(2, lockedAttempt));
+        await this.sleepImpl(5000 * Math.pow(2, lockedAttempt));
       }
     }
 
@@ -108,7 +117,7 @@ export class PostmanSmokeClient {
     }
 
     for (let attempt = 0; attempt < 45; attempt += 1) {
-      await sleep(2000);
+      await this.sleepImpl(2000);
       const task = await this.request(taskUrl);
       const taskRecord = asRecord(task);
       const nestedTask = asRecord(taskRecord?.task);
@@ -138,10 +147,21 @@ export class PostmanSmokeClient {
   }
 
   async updateCollection(collectionUid: string, collection: unknown): Promise<void> {
-    await this.request(`/collections/${collectionUid}`, {
-      method: 'PUT',
-      body: JSON.stringify({ collection })
-    });
+    const maxDeepUpdateRetries = 8;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.request(`/collections/${collectionUid}`, {
+          method: 'PUT',
+          body: JSON.stringify({ collection })
+        });
+        return;
+      } catch (error) {
+        if (!isDeepUpdateConflict(error) || attempt >= maxDeepUpdateRetries) {
+          throw error;
+        }
+        await this.sleepImpl(Math.min(30000, 5000 * Math.pow(2, attempt)));
+      }
+    }
   }
 
   async deleteCollection(collectionUid: string): Promise<void> {

@@ -28281,7 +28281,7 @@ var customerPreviewActionContract = {
     "workspace-id": { required: true },
     "spec-id": { required: true },
     "smoke-collection-id": { required: true },
-    "flow-path": { required: true },
+    "flow-path": { required: false },
     "postman-api-key": { required: true },
     "auth-config-json": { required: false },
     "secrets-resolver-enabled": { required: false, default: "true" },
@@ -28747,6 +28747,8 @@ function createSecretsResolverItem() {
 }
 
 // src/postman/collection-transform.ts
+var GENERATED_OAUTH_EVENT_MARKER = "[Smoke Flow] Auto-generated OAuth2 client-credentials token cache";
+var LEGACY_SECRETS_RESOLVER_ITEM_NAME = "00 - Resolve Secrets";
 function asRecord2(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
@@ -28934,9 +28936,10 @@ function setRequestBearerAuth(request, authConfig) {
 }
 function applyAuthToRequest(request, authConfig) {
   if (!authConfig?.enabled) {
-    return;
+    return false;
   }
   setRequestBearerAuth(request, authConfig);
+  return true;
 }
 function upsertCollectionVariable(collection, key, value = "") {
   const variables = Array.isArray(collection.variable) ? collection.variable.map((entry) => asRecord2(entry)).filter((entry) => Boolean(entry)) : [];
@@ -28960,6 +28963,20 @@ function seedOAuthCollectionVariables(collection, authConfig) {
   upsertCollectionVariable(collection, variables.accessToken);
   upsertCollectionVariable(collection, variables.expiresAt);
 }
+function getScriptExecText(event) {
+  const script = asRecord2(event.script);
+  const exec2 = script?.exec;
+  if (Array.isArray(exec2)) {
+    return exec2.map((line) => String(line)).join("\n");
+  }
+  if (typeof exec2 === "string") {
+    return exec2;
+  }
+  return "";
+}
+function isGeneratedOAuthEvent(event) {
+  return event.listen === "prerequest" && getScriptExecText(event).includes(GENERATED_OAUTH_EVENT_MARKER);
+}
 function applyCollectionAuth(collection, authConfig) {
   if (!authConfig?.enabled) {
     return;
@@ -28967,9 +28984,79 @@ function applyCollectionAuth(collection, authConfig) {
   seedOAuthCollectionVariables(collection, authConfig);
   const existingEvents = Array.isArray(collection.event) ? collection.event : [];
   collection.event = [
-    ...existingEvents.map((entry) => asRecord2(entry)).filter((entry) => Boolean(entry)),
+    ...existingEvents.map((entry) => asRecord2(entry)).filter((entry) => Boolean(entry)).filter((entry) => !isGeneratedOAuthEvent(entry)),
     createOAuthPreRequestEvent(authConfig)
   ];
+}
+function applyAuthToCollectionItems(items, authConfig) {
+  if (!Array.isArray(items)) {
+    return 0;
+  }
+  return items.reduce((count, entry) => {
+    const item = asRecord2(entry);
+    if (!item) {
+      return count;
+    }
+    let nextCount = count;
+    const request = asRecord2(item.request);
+    const itemName = typeof item.name === "string" ? item.name : "";
+    if (request && itemName !== LEGACY_SECRETS_RESOLVER_ITEM_NAME && applyAuthToRequest(request, authConfig)) {
+      nextCount += 1;
+    }
+    return nextCount + applyAuthToCollectionItems(item.item, authConfig);
+  }, 0);
+}
+function getRequestUrlText(request) {
+  const url = request.url;
+  if (typeof url === "string") {
+    return url;
+  }
+  const urlRecord = asRecord2(url);
+  if (!urlRecord) {
+    return "";
+  }
+  if (typeof urlRecord.raw === "string") {
+    return urlRecord.raw;
+  }
+  const host = Array.isArray(urlRecord.host) ? urlRecord.host.map(String).join(".") : "";
+  const path8 = Array.isArray(urlRecord.path) ? urlRecord.path.map(String).join("/") : "";
+  return [host, path8].filter(Boolean).join("/");
+}
+function isSecretsResolverItem(item) {
+  const name = typeof item.name === "string" ? item.name.trim().toLowerCase() : "";
+  if (name === LEGACY_SECRETS_RESOLVER_ITEM_NAME.toLowerCase() || name === "resolve secrets") {
+    return true;
+  }
+  const request = asRecord2(item.request);
+  if (!request) {
+    return false;
+  }
+  const auth = asRecord2(request.auth);
+  const authType = typeof auth?.type === "string" ? auth.type.toLowerCase() : "";
+  const urlText = getRequestUrlText(request).toLowerCase();
+  const headers = Array.isArray(request.header) ? request.header.map((entry) => asRecord2(entry)).filter((entry) => Boolean(entry)) : [];
+  const hasSecretsManagerTarget = headers.some(
+    (entry) => typeof entry.key === "string" && entry.key.toLowerCase() === "x-amz-target" && String(entry.value ?? "").toLowerCase().includes("secretsmanager.getsecretvalue")
+  );
+  return authType === "awsv4" && (urlText.includes("secretsmanager") || hasSecretsManagerTarget);
+}
+function removeSecretsResolverItems(items) {
+  if (!Array.isArray(items)) {
+    return items;
+  }
+  return items.map((entry) => {
+    const item = asRecord2(entry);
+    if (!item) {
+      return entry;
+    }
+    if (Array.isArray(item.item)) {
+      item.item = removeSecretsResolverItems(item.item);
+    }
+    return item;
+  }).filter((entry) => {
+    const item = asRecord2(entry);
+    return !item || !isSecretsResolverItem(item);
+  });
 }
 function curateRequestItem(resolved, authConfig) {
   const item = structuredClone(resolved.item);
@@ -28982,6 +29069,18 @@ function curateRequestItem(resolved, authConfig) {
   }
   applyFlowScripts(item, resolved.step);
   return item;
+}
+function applySmokeCollectionAuth(existingCollection, authConfig, options = {}) {
+  const collection = sanitizeForCollectionUpdate(structuredClone(existingCollection));
+  if (options.secretsResolverEnabled === false) {
+    collection.item = removeSecretsResolverItems(collection.item);
+  }
+  applyCollectionAuth(collection, authConfig);
+  const authRequestCount = applyAuthToCollectionItems(collection.item, authConfig);
+  return {
+    collection: sanitizeForCollectionUpdate(collection),
+    authRequestCount
+  };
 }
 function buildCuratedSmokeCollection(generatedCollection, flow, resolvedRequests, authConfig, secretsResolverEnabled = true) {
   const collection = sanitizeForCollectionUpdate(structuredClone(generatedCollection));
@@ -29013,15 +29112,24 @@ function sleep(ms) {
 function asRecord3(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
+function isDeepUpdateConflict(error2) {
+  if (!(error2 instanceof HttpError) || error2.status !== 409) {
+    return false;
+  }
+  const message = error2.message.toLowerCase();
+  return message.includes("deepupdate") || message.includes("currently being modified");
+}
 var PostmanSmokeClient = class {
-  constructor(apiKey, baseUrl = "https://api.getpostman.com", fetchImpl = fetch) {
+  constructor(apiKey, baseUrl = "https://api.getpostman.com", fetchImpl = fetch, sleepImpl = sleep) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl;
     this.fetchImpl = fetchImpl;
+    this.sleepImpl = sleepImpl;
   }
   apiKey;
   baseUrl;
   fetchImpl;
+  sleepImpl;
   async request(path8, init = {}) {
     const url = path8.startsWith("http") ? path8 : `${this.baseUrl.replace(/\/+$/g, "")}${path8}`;
     const response = await this.fetchImpl(url, {
@@ -29074,7 +29182,7 @@ var PostmanSmokeClient = class {
         if (!isLocked || lockedAttempt >= maxLockedRetries) {
           throw error2;
         }
-        await sleep(5e3 * Math.pow(2, lockedAttempt));
+        await this.sleepImpl(5e3 * Math.pow(2, lockedAttempt));
       }
     }
     if (!generationResponse) {
@@ -29094,7 +29202,7 @@ var PostmanSmokeClient = class {
       taskUrl = `/specs/${specId}/tasks/${taskId}`;
     }
     for (let attempt = 0; attempt < 45; attempt += 1) {
-      await sleep(2e3);
+      await this.sleepImpl(2e3);
       const task = await this.request(taskUrl);
       const taskRecord = asRecord3(task);
       const nestedTask = asRecord3(taskRecord?.task);
@@ -29121,10 +29229,21 @@ var PostmanSmokeClient = class {
     return collection;
   }
   async updateCollection(collectionUid, collection) {
-    await this.request(`/collections/${collectionUid}`, {
-      method: "PUT",
-      body: JSON.stringify({ collection })
-    });
+    const maxDeepUpdateRetries = 8;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.request(`/collections/${collectionUid}`, {
+          method: "PUT",
+          body: JSON.stringify({ collection })
+        });
+        return;
+      } catch (error2) {
+        if (!isDeepUpdateConflict(error2) || attempt >= maxDeepUpdateRetries) {
+          throw error2;
+        }
+        await this.sleepImpl(Math.min(3e4, 5e3 * Math.pow(2, attempt)));
+      }
+    }
   }
   async deleteCollection(collectionUid) {
     try {
@@ -29191,7 +29310,7 @@ function readActionInputs(env = process.env) {
     workspaceId: getInput2("workspace-id", env),
     specId: getInput2("spec-id", env),
     smokeCollectionId: getInput2("smoke-collection-id", env),
-    flowPath: getInput2("flow-path", env),
+    flowPath: getInput2("flow-path", env) || void 0,
     postmanApiKey: getInput2("postman-api-key", env),
     authConfig: parseAuthConfig(getInput2("auth-config-json", env)),
     secretsResolverEnabled: parseBooleanInput(getInput2("secrets-resolver-enabled", env), true),
@@ -29238,12 +29357,56 @@ function createOutputs(summary2) {
     "assertion-count": String(summary2.assertionCount)
   };
 }
+async function runWithoutFlowManifest(inputs, dependencies) {
+  if (!inputs.authConfig?.enabled) {
+    dependencies.core.info("No flow-path or enabled auth-config-json was provided; skipping Smoke collection update.");
+    return createOutputs({
+      flowName: "",
+      status: "skipped",
+      canonicalSmokeCollectionId: inputs.smokeCollectionId,
+      authApplied: false,
+      authRequestCount: 0,
+      stepCount: 0,
+      resolvedOperationCount: 0,
+      appliedBindingCount: 0,
+      appliedExtractCount: 0,
+      assertionCount: 0,
+      warnings: []
+    });
+  }
+  const existingCollection = await dependencies.postman.getCollection(inputs.smokeCollectionId);
+  const transformed = applySmokeCollectionAuth(existingCollection, inputs.authConfig, {
+    secretsResolverEnabled: inputs.secretsResolverEnabled
+  });
+  writeDebugDump(inputs.debugDumpPath, transformed.collection, dependencies.core);
+  await dependencies.postman.updateCollection(inputs.smokeCollectionId, transformed.collection);
+  dependencies.core.info(
+    `Updated canonical Smoke collection ${inputs.smokeCollectionId} with Smoke OAuth auth on ${transformed.authRequestCount} request(s).`
+  );
+  return createOutputs({
+    flowName: "",
+    status: "skipped",
+    canonicalSmokeCollectionId: inputs.smokeCollectionId,
+    authApplied: true,
+    authRequestCount: transformed.authRequestCount,
+    stepCount: 0,
+    resolvedOperationCount: 0,
+    appliedBindingCount: 0,
+    appliedExtractCount: 0,
+    assertionCount: 0,
+    warnings: ["flow-path was not provided; applied OAuth to the existing Smoke collection without flow curation."]
+  });
+}
 async function runSmokeFlow(inputs, dependencies) {
   ensureRequiredInputs(inputs);
   if (inputs.collectionSyncMode !== "refresh") {
     throw new Error(`collection-sync-mode=refresh is the only supported mode for postman-smoke-flow-action; received ${inputs.collectionSyncMode}.`);
   }
-  const manifest = loadFlowManifest(inputs.flowPath);
+  const flowPath = inputs.flowPath?.trim();
+  if (!flowPath) {
+    return runWithoutFlowManifest(inputs, dependencies);
+  }
+  const manifest = loadFlowManifest(flowPath);
   const { flow, warnings } = validateFlowManifest(manifest);
   const flowName = flow.name;
   warnings.forEach((warning2) => dependencies.core.warning(warning2.message));
@@ -29273,6 +29436,7 @@ async function runSmokeFlow(inputs, dependencies) {
       status: "success",
       temporaryCollectionId: tempCollectionId,
       canonicalSmokeCollectionId: inputs.smokeCollectionId,
+      authApplied: Boolean(inputs.authConfig?.enabled),
       stepCount: flow.steps.length,
       resolvedOperationCount: resolvedRequests.length,
       appliedBindingCount: transformed.bindingCount,
@@ -29288,6 +29452,7 @@ async function runSmokeFlow(inputs, dependencies) {
       status: "failed",
       temporaryCollectionId: tempCollectionId || void 0,
       canonicalSmokeCollectionId: inputs.smokeCollectionId,
+      authApplied: Boolean(inputs.authConfig?.enabled),
       stepCount: 0,
       resolvedOperationCount: 0,
       appliedBindingCount: 0,
