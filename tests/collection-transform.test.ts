@@ -449,8 +449,14 @@ describe('collection transform', () => {
               }
             },
             {
-              name: '00 - Resolve Secrets',
+              name: 'Resolve Secrets',
               request: {
+                auth: {
+                  type: 'awsv4'
+                },
+                header: [
+                  { key: 'X-Amz-Target', value: 'secretsmanager.GetSecretValue' }
+                ],
                 method: 'POST',
                 url: 'https://secretsmanager.us-west-2.amazonaws.com'
               }
@@ -458,10 +464,16 @@ describe('collection transform', () => {
           ]
         },
         {
-          name: '00 - Resolve Secrets',
+          name: ' 00 - resolve secrets ',
           request: {
+            auth: {
+              type: 'awsv4'
+            },
             method: 'POST',
-            url: 'https://secretsmanager.us-west-2.amazonaws.com'
+            url: {
+              raw: 'https://secretsmanager.us-west-2.amazonaws.com',
+              host: ['secretsmanager', 'us-west-2', 'amazonaws', 'com']
+            }
           }
         }
       ]

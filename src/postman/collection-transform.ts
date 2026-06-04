@@ -326,6 +326,49 @@ function applyAuthToCollectionItems(items: unknown, authConfig: SmokeAuthConfig)
   }, 0);
 }
 
+function getRequestUrlText(request: JsonRecord): string {
+  const url = request.url;
+  if (typeof url === 'string') {
+    return url;
+  }
+  const urlRecord = asRecord(url);
+  if (!urlRecord) {
+    return '';
+  }
+  if (typeof urlRecord.raw === 'string') {
+    return urlRecord.raw;
+  }
+  const host = Array.isArray(urlRecord.host) ? urlRecord.host.map(String).join('.') : '';
+  const path = Array.isArray(urlRecord.path) ? urlRecord.path.map(String).join('/') : '';
+  return [host, path].filter(Boolean).join('/');
+}
+
+function isSecretsResolverItem(item: JsonRecord): boolean {
+  const name = typeof item.name === 'string' ? item.name.trim().toLowerCase() : '';
+  if (name === LEGACY_SECRETS_RESOLVER_ITEM_NAME.toLowerCase() || name === 'resolve secrets') {
+    return true;
+  }
+
+  const request = asRecord(item.request);
+  if (!request) {
+    return false;
+  }
+  const auth = asRecord(request.auth);
+  const authType = typeof auth?.type === 'string' ? auth.type.toLowerCase() : '';
+  const urlText = getRequestUrlText(request).toLowerCase();
+  const headers = Array.isArray(request.header)
+    ? request.header.map((entry) => asRecord(entry)).filter((entry): entry is JsonRecord => Boolean(entry))
+    : [];
+  const hasSecretsManagerTarget = headers.some(
+    (entry) =>
+      typeof entry.key === 'string' &&
+      entry.key.toLowerCase() === 'x-amz-target' &&
+      String(entry.value ?? '').toLowerCase().includes('secretsmanager.getsecretvalue')
+  );
+
+  return authType === 'awsv4' && (urlText.includes('secretsmanager') || hasSecretsManagerTarget);
+}
+
 function removeSecretsResolverItems(items: unknown): unknown {
   if (!Array.isArray(items)) {
     return items;
@@ -344,7 +387,7 @@ function removeSecretsResolverItems(items: unknown): unknown {
     })
     .filter((entry) => {
       const item = asRecord(entry);
-      return !item || item.name !== LEGACY_SECRETS_RESOLVER_ITEM_NAME;
+      return !item || !isSecretsResolverItem(item);
     });
 }
 

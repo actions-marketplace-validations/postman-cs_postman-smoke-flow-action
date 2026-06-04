@@ -29025,6 +29025,40 @@ function applyAuthToCollectionItems(items, authConfig) {
     return nextCount + applyAuthToCollectionItems(item.item, authConfig);
   }, 0);
 }
+function getRequestUrlText(request) {
+  const url = request.url;
+  if (typeof url === "string") {
+    return url;
+  }
+  const urlRecord = asRecord2(url);
+  if (!urlRecord) {
+    return "";
+  }
+  if (typeof urlRecord.raw === "string") {
+    return urlRecord.raw;
+  }
+  const host = Array.isArray(urlRecord.host) ? urlRecord.host.map(String).join(".") : "";
+  const path8 = Array.isArray(urlRecord.path) ? urlRecord.path.map(String).join("/") : "";
+  return [host, path8].filter(Boolean).join("/");
+}
+function isSecretsResolverItem(item) {
+  const name = typeof item.name === "string" ? item.name.trim().toLowerCase() : "";
+  if (name === LEGACY_SECRETS_RESOLVER_ITEM_NAME.toLowerCase() || name === "resolve secrets") {
+    return true;
+  }
+  const request = asRecord2(item.request);
+  if (!request) {
+    return false;
+  }
+  const auth = asRecord2(request.auth);
+  const authType = typeof auth?.type === "string" ? auth.type.toLowerCase() : "";
+  const urlText = getRequestUrlText(request).toLowerCase();
+  const headers = Array.isArray(request.header) ? request.header.map((entry) => asRecord2(entry)).filter((entry) => Boolean(entry)) : [];
+  const hasSecretsManagerTarget = headers.some(
+    (entry) => typeof entry.key === "string" && entry.key.toLowerCase() === "x-amz-target" && String(entry.value ?? "").toLowerCase().includes("secretsmanager.getsecretvalue")
+  );
+  return authType === "awsv4" && (urlText.includes("secretsmanager") || hasSecretsManagerTarget);
+}
 function removeSecretsResolverItems(items) {
   if (!Array.isArray(items)) {
     return items;
@@ -29040,7 +29074,7 @@ function removeSecretsResolverItems(items) {
     return item;
   }).filter((entry) => {
     const item = asRecord2(entry);
-    return !item || item.name !== LEGACY_SECRETS_RESOLVER_ITEM_NAME;
+    return !item || !isSecretsResolverItem(item);
   });
 }
 function curateRequestItem(resolved, authConfig) {
