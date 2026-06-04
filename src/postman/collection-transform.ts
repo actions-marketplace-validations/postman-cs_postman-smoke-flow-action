@@ -326,6 +326,28 @@ function applyAuthToCollectionItems(items: unknown, authConfig: SmokeAuthConfig)
   }, 0);
 }
 
+function removeSecretsResolverItems(items: unknown): unknown {
+  if (!Array.isArray(items)) {
+    return items;
+  }
+
+  return items
+    .map((entry) => {
+      const item = asRecord(entry);
+      if (!item) {
+        return entry;
+      }
+      if (Array.isArray(item.item)) {
+        item.item = removeSecretsResolverItems(item.item);
+      }
+      return item;
+    })
+    .filter((entry) => {
+      const item = asRecord(entry);
+      return !item || item.name !== LEGACY_SECRETS_RESOLVER_ITEM_NAME;
+    });
+}
+
 function curateRequestItem(resolved: ResolvedRequest, authConfig?: SmokeAuthConfig): JsonRecord {
   const item = structuredClone(resolved.item);
   item.name = resolved.step.name?.trim() || resolved.step.operationId;
@@ -341,9 +363,13 @@ function curateRequestItem(resolved: ResolvedRequest, authConfig?: SmokeAuthConf
 
 export function applySmokeCollectionAuth(
   existingCollection: JsonRecord,
-  authConfig: SmokeAuthConfig
+  authConfig: SmokeAuthConfig,
+  options: { secretsResolverEnabled?: boolean } = {}
 ): { collection: JsonRecord; authRequestCount: number } {
   const collection = sanitizeForCollectionUpdate(structuredClone(existingCollection)) as JsonRecord;
+  if (options.secretsResolverEnabled === false) {
+    collection.item = removeSecretsResolverItems(collection.item);
+  }
   applyCollectionAuth(collection, authConfig);
   const authRequestCount = applyAuthToCollectionItems(collection.item, authConfig);
   return {

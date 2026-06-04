@@ -149,7 +149,9 @@ async function runWithoutFlowManifest(
   }
 
   const existingCollection = await dependencies.postman.getCollection(inputs.smokeCollectionId);
-  const transformed = applySmokeCollectionAuth(existingCollection, inputs.authConfig);
+  const transformed = applySmokeCollectionAuth(existingCollection, inputs.authConfig, {
+    secretsResolverEnabled: inputs.secretsResolverEnabled
+  });
   writeDebugDump(inputs.debugDumpPath, transformed.collection, dependencies.core);
   await dependencies.postman.updateCollection(inputs.smokeCollectionId, transformed.collection);
   dependencies.core.info(

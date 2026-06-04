@@ -433,4 +433,50 @@ describe('collection transform', () => {
     expect(collectionText).toContain('Existing manual collection script');
     expect(collectionText).not.toContain('old generated script');
   });
+
+  it('removes the legacy secrets resolver during auth-only updates when disabled', () => {
+    const existingCollection = {
+      info: { name: '[Smoke] Providers API' },
+      item: [
+        {
+          name: 'Providers',
+          item: [
+            {
+              name: 'searchProviders',
+              request: {
+                method: 'GET',
+                url: '{{baseUrl}}/v1/providers'
+              }
+            },
+            {
+              name: '00 - Resolve Secrets',
+              request: {
+                method: 'POST',
+                url: 'https://secretsmanager.us-west-2.amazonaws.com'
+              }
+            }
+          ]
+        },
+        {
+          name: '00 - Resolve Secrets',
+          request: {
+            method: 'POST',
+            url: 'https://secretsmanager.us-west-2.amazonaws.com'
+          }
+        }
+      ]
+    };
+
+    const result = applySmokeCollectionAuth(existingCollection, oauthConfig, {
+      secretsResolverEnabled: false
+    });
+    const collectionText = JSON.stringify(result.collection);
+    const items = result.collection.item as Array<Record<string, unknown>>;
+    const folderItems = items[0]?.item as Array<Record<string, unknown>>;
+
+    expect(result.authRequestCount).toBe(1);
+    expect(items.map((item) => item.name)).toEqual(['Providers']);
+    expect(folderItems.map((item) => item.name)).toEqual(['searchProviders']);
+    expect(collectionText).not.toContain('00 - Resolve Secrets');
+  });
 });

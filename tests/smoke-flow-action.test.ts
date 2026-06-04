@@ -175,6 +175,13 @@ describe('runSmokeFlow', () => {
                   header: [{ key: 'Authorization', value: 'Bearer old-token' }],
                   url: 'https://api.example.com/payments'
                 }
+              },
+              {
+                name: '00 - Resolve Secrets',
+                request: {
+                  method: 'POST',
+                  url: 'https://secretsmanager.us-west-2.amazonaws.com'
+                }
               }
             ]
           }
@@ -188,6 +195,7 @@ describe('runSmokeFlow', () => {
       const outputs = await runSmokeFlow({
         ...createInputs(tempDir),
         flowPath: undefined,
+        secretsResolverEnabled: false,
         authConfig: oauthConfig
       }, { core, postman });
       const summary = JSON.parse(outputs['flow-apply-summary-json']) as Record<string, unknown>;
@@ -211,6 +219,7 @@ describe('runSmokeFlow', () => {
       });
       expect(request.header).toEqual([]);
       expect(JSON.stringify(updatedCollection)).toContain('Auto-generated OAuth2 client-credentials token cache');
+      expect(JSON.stringify(updatedCollection)).not.toContain('00 - Resolve Secrets');
     } finally {
       process.chdir(previousCwd);
       rmSync(tempDir, { recursive: true, force: true });

@@ -29025,6 +29025,24 @@ function applyAuthToCollectionItems(items, authConfig) {
     return nextCount + applyAuthToCollectionItems(item.item, authConfig);
   }, 0);
 }
+function removeSecretsResolverItems(items) {
+  if (!Array.isArray(items)) {
+    return items;
+  }
+  return items.map((entry) => {
+    const item = asRecord2(entry);
+    if (!item) {
+      return entry;
+    }
+    if (Array.isArray(item.item)) {
+      item.item = removeSecretsResolverItems(item.item);
+    }
+    return item;
+  }).filter((entry) => {
+    const item = asRecord2(entry);
+    return !item || item.name !== LEGACY_SECRETS_RESOLVER_ITEM_NAME;
+  });
+}
 function curateRequestItem(resolved, authConfig) {
   const item = structuredClone(resolved.item);
   item.name = resolved.step.name?.trim() || resolved.step.operationId;
@@ -29037,8 +29055,11 @@ function curateRequestItem(resolved, authConfig) {
   applyFlowScripts(item, resolved.step);
   return item;
 }
-function applySmokeCollectionAuth(existingCollection, authConfig) {
+function applySmokeCollectionAuth(existingCollection, authConfig, options = {}) {
   const collection = sanitizeForCollectionUpdate(structuredClone(existingCollection));
+  if (options.secretsResolverEnabled === false) {
+    collection.item = removeSecretsResolverItems(collection.item);
+  }
   applyCollectionAuth(collection, authConfig);
   const authRequestCount = applyAuthToCollectionItems(collection.item, authConfig);
   return {
@@ -29339,7 +29360,9 @@ async function runWithoutFlowManifest(inputs, dependencies) {
     });
   }
   const existingCollection = await dependencies.postman.getCollection(inputs.smokeCollectionId);
-  const transformed = applySmokeCollectionAuth(existingCollection, inputs.authConfig);
+  const transformed = applySmokeCollectionAuth(existingCollection, inputs.authConfig, {
+    secretsResolverEnabled: inputs.secretsResolverEnabled
+  });
   writeDebugDump(inputs.debugDumpPath, transformed.collection, dependencies.core);
   await dependencies.postman.updateCollection(inputs.smokeCollectionId, transformed.collection);
   dependencies.core.info(
