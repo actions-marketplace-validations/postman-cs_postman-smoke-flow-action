@@ -29076,15 +29076,24 @@ function sleep(ms) {
 function asRecord3(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
+function isDeepUpdateConflict(error2) {
+  if (!(error2 instanceof HttpError) || error2.status !== 409) {
+    return false;
+  }
+  const message = error2.message.toLowerCase();
+  return message.includes("deepupdate") || message.includes("currently being modified");
+}
 var PostmanSmokeClient = class {
-  constructor(apiKey, baseUrl = "https://api.getpostman.com", fetchImpl = fetch) {
+  constructor(apiKey, baseUrl = "https://api.getpostman.com", fetchImpl = fetch, sleepImpl = sleep) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl;
     this.fetchImpl = fetchImpl;
+    this.sleepImpl = sleepImpl;
   }
   apiKey;
   baseUrl;
   fetchImpl;
+  sleepImpl;
   async request(path8, init = {}) {
     const url = path8.startsWith("http") ? path8 : `${this.baseUrl.replace(/\/+$/g, "")}${path8}`;
     const response = await this.fetchImpl(url, {
@@ -29137,7 +29146,7 @@ var PostmanSmokeClient = class {
         if (!isLocked || lockedAttempt >= maxLockedRetries) {
           throw error2;
         }
-        await sleep(5e3 * Math.pow(2, lockedAttempt));
+        await this.sleepImpl(5e3 * Math.pow(2, lockedAttempt));
       }
     }
     if (!generationResponse) {
@@ -29157,7 +29166,7 @@ var PostmanSmokeClient = class {
       taskUrl = `/specs/${specId}/tasks/${taskId}`;
     }
     for (let attempt = 0; attempt < 45; attempt += 1) {
-      await sleep(2e3);
+      await this.sleepImpl(2e3);
       const task = await this.request(taskUrl);
       const taskRecord = asRecord3(task);
       const nestedTask = asRecord3(taskRecord?.task);
@@ -29184,10 +29193,21 @@ var PostmanSmokeClient = class {
     return collection;
   }
   async updateCollection(collectionUid, collection) {
-    await this.request(`/collections/${collectionUid}`, {
-      method: "PUT",
-      body: JSON.stringify({ collection })
-    });
+    const maxDeepUpdateRetries = 8;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.request(`/collections/${collectionUid}`, {
+          method: "PUT",
+          body: JSON.stringify({ collection })
+        });
+        return;
+      } catch (error2) {
+        if (!isDeepUpdateConflict(error2) || attempt >= maxDeepUpdateRetries) {
+          throw error2;
+        }
+        await this.sleepImpl(Math.min(3e4, 5e3 * Math.pow(2, attempt)));
+      }
+    }
   }
   async deleteCollection(collectionUid) {
     try {
