@@ -33,14 +33,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - id: bootstrap
-        uses: postman-cs/postman-bootstrap-action@v0
+        uses: postman-cs/postman-bootstrap-action@v1
         with:
           project-name: core-payments
           spec-url: https://example.com/openapi.yaml
           postman-api-key: ${{ secrets.POSTMAN_API_KEY }}
 
       - id: smoke_flow
-        uses: postman-cs/postman-smoke-flow-action@v0
+        uses: postman-cs/postman-smoke-flow-action@v1
         with:
           project-name: core-payments
           workspace-id: ${{ steps.bootstrap.outputs.workspace-id }}
@@ -50,7 +50,7 @@ jobs:
           postman-api-key: ${{ secrets.POSTMAN_API_KEY }}
 
       - id: repo_sync
-        uses: postman-cs/postman-repo-sync-action@v0
+        uses: postman-cs/postman-repo-sync-action@v1
         with:
           project-name: core-payments
           workspace-id: ${{ steps.bootstrap.outputs.workspace-id }}
@@ -66,7 +66,7 @@ To inject OAuth into the existing Smoke collection before a `flow.yaml` exists, 
 
 ```yaml
 - id: smoke_flow
-  uses: postman-cs/postman-smoke-flow-action@v0
+  uses: postman-cs/postman-smoke-flow-action@v1
   with:
     project-name: core-payments
     workspace-id: ${{ steps.bootstrap.outputs.workspace-id }}
@@ -235,6 +235,6 @@ npm run check:dist
 
 ## Customer Preview Release Strategy
 
-- Publish immutable `v0.x.y` tags for releases.
-- Keep the rolling `v0` tag aligned to the latest customer preview release.
+- Publish immutable `v1.x.y` tags for releases.
+- Keep the rolling `v1` tag aligned to the latest customer preview release.
 - Run CI before tagging so lint, tests, typecheck, bundle integrity, and actionlint all pass.
