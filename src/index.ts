@@ -16,7 +16,7 @@ import {
   type CollectionVerification
 } from './postman/collection-transform.js';
 import { PostmanSmokeClient } from './postman/postman-smoke-client.js';
-import { createTelemetryContext } from './lib/telemetry.js';
+import { createTelemetryContext } from '@postman-cse/automation-telemetry-core';
 
 type JsonRecord = Record<string, unknown>;
 
