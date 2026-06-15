@@ -38,7 +38,7 @@ npm run check:dist   # build + git diff --exit-code (CI integrity)
 
 - **Flow apply**: Loads the curated `flow.yaml`, resolves each step against the live Smoke collection, and rewrites the collection so request order, chaining, and variables match the flow.
 - **OAuth2 (optional)**: When configured, injects token-acquisition scripts so the smoke run authenticates before exercising endpoints.
-- **Idempotent reshape**: Operates on the existing canonical Smoke collection by id; it transforms in place rather than creating a parallel collection.
+- **Idempotent reshape**: Operates on the existing canonical Smoke collection by id and transforms it in place.
 
 ## Gotchas
 
