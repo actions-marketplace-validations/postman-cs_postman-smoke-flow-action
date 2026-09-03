@@ -1,8 +1,22 @@
-import type { FlowBinding, FlowDefinition, FlowStep, ResolvedRequest, SmokeAuthConfig } from '../types.js';
+import type {
+  FlowBinding,
+  FlowDefinition,
+  FlowStep,
+  ResolvedRequest,
+  SmokeApiKeyConfig,
+  SmokeAuthConfig,
+  SmokeOAuthConfig
+} from '../types.js';
+import {
+  createSecretsResolverItem,
+  isSecretsResolverEnabled,
+  SECRETS_RESOLVER_ITEM_NAME,
+  type SecretsResolverProvider
+} from '@postman-cs/automation-core';
+
 import {
   createOAuthPreRequestEvent,
   createPreRequestEvent,
-  createSecretsResolverItem,
   createTestEvent,
   countAssertionsForStep
 } from './scripts.js';
@@ -13,8 +27,25 @@ export type CollectionVerification = {
   summary: string;
 };
 
+export type GeneratedSmokeCollectionBuildOptions = {
+  secretsResolverProvider?: SecretsResolverProvider;
+  collectionName?: string;
+  scriptSourceCollection?: JsonRecord;
+  /**
+   * The canonical Smoke collection currently in Postman. Bootstrap elects and
+   * adopts that final by exact `info.name`; a refresh that renames it via the
+   * `/name` PATCH breaks election and triggers a fresh import/orphan cascade.
+   * Carry `info.name` forward from the canonical target, not the generated
+   * source. `info.description` is carried forward defensively — the root PATCH
+   * never writes it, so any bootstrap marker there is preserved simply by never
+   * being touched, whether or not the read snapshot surfaces it.
+   */
+  canonicalCollection?: JsonRecord;
+};
+
 const GENERATED_OAUTH_EVENT_MARKER = '[Smoke Flow] Auto-generated OAuth2 client-credentials token cache';
-const LEGACY_SECRETS_RESOLVER_ITEM_NAME = '00 - Resolve Secrets';
+const LEGACY_SECRETS_RESOLVER_ITEM_NAME = SECRETS_RESOLVER_ITEM_NAME;
+const UNSAFE_OBJECT_PATH_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function asRecord(value: unknown): JsonRecord | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonRecord) : null;
@@ -50,6 +81,9 @@ function sanitizeForCollectionUpdate(value: unknown): unknown {
 
 function setNestedValue(root: JsonRecord, dottedKey: string, value: unknown): void {
   const segments = dottedKey.split('.');
+  if (segments.some((segment) => UNSAFE_OBJECT_PATH_SEGMENTS.has(segment))) {
+    throw new Error(`Unsafe binding fieldKey: ${dottedKey}`);
+  }
   let cursor: JsonRecord = root;
   for (let index = 0; index < segments.length - 1; index += 1) {
     const segment = segments[index]!;
@@ -62,6 +96,12 @@ function setNestedValue(root: JsonRecord, dottedKey: string, value: unknown): vo
     cursor = cursor[segment] as JsonRecord;
   }
   cursor[segments[segments.length - 1]!] = value;
+}
+
+function assertSafeBindingFieldKey(fieldKey: string): void {
+  if (fieldKey.split('.').some((segment) => UNSAFE_OBJECT_PATH_SEGMENTS.has(segment))) {
+    throw new Error(`Unsafe binding fieldKey: ${fieldKey}`);
+  }
 }
 
 function getVariableBindings(step: FlowStep) {
@@ -123,8 +163,9 @@ function updateRequestUrl(request: JsonRecord, step: FlowStep): void {
   if (typeof url === 'string') {
     let next = url;
     for (const binding of variableBindings) {
-      next = next.replace(new RegExp(`\\{${binding.fieldKey}\\}`, 'g'), `{{${binding.fieldKey}}}`);
-      next = next.replace(new RegExp(`:${binding.fieldKey}(?=[/?&#]|$)`, 'g'), `{{${binding.fieldKey}}}`);
+      const fieldPattern = escapeRegExp(binding.fieldKey);
+      next = next.replace(new RegExp(`\\{${fieldPattern}\\}`, 'g'), `{{${binding.fieldKey}}}`);
+      next = next.replace(new RegExp(`:${fieldPattern}(?=[/?&#]|$)`, 'g'), `{{${binding.fieldKey}}}`);
     }
     request.url = updateRawUrlQuery(next, step);
     return;
@@ -138,8 +179,9 @@ function updateRequestUrl(request: JsonRecord, step: FlowStep): void {
   if (typeof urlRecord.raw === 'string') {
     let nextRaw = urlRecord.raw;
     for (const binding of variableBindings) {
-      nextRaw = nextRaw.replace(new RegExp(`\\{${binding.fieldKey}\\}`, 'g'), `{{${binding.fieldKey}}}`);
-      nextRaw = nextRaw.replace(new RegExp(`:${binding.fieldKey}(?=[/?&#]|$)`, 'g'), `{{${binding.fieldKey}}}`);
+      const fieldPattern = escapeRegExp(binding.fieldKey);
+      nextRaw = nextRaw.replace(new RegExp(`\\{${fieldPattern}\\}`, 'g'), `{{${binding.fieldKey}}}`);
+      nextRaw = nextRaw.replace(new RegExp(`:${fieldPattern}(?=[/?&#]|$)`, 'g'), `{{${binding.fieldKey}}}`);
     }
     urlRecord.raw = updateRawUrlQuery(nextRaw, step);
   }
@@ -173,6 +215,7 @@ function updateRequestUrl(request: JsonRecord, step: FlowStep): void {
 
 function updateRequestBody(request: JsonRecord, step: FlowStep): void {
   const variableBindings = getVariableBindings(step);
+  variableBindings.forEach((binding) => assertSafeBindingFieldKey(binding.fieldKey));
   const body = asRecord(request.body);
   if (!body || body.mode !== 'raw' || typeof body.raw !== 'string') {
     return;
@@ -213,7 +256,48 @@ function removeHeader(request: JsonRecord, key: string): void {
   request.header = headers.filter((entry) => typeof entry.key !== 'string' || entry.key.toLowerCase() !== key.toLowerCase());
 }
 
-function getAuthVariableNames(authConfig: SmokeAuthConfig): Required<NonNullable<SmokeAuthConfig['variables']>> {
+function removeRawUrlQueryParam(rawUrl: string, key: string): string {
+  const [withoutHash, hash = ''] = rawUrl.split('#', 2);
+  const queryIndex = withoutHash.indexOf('?');
+  if (queryIndex === -1) {
+    return rawUrl;
+  }
+
+  const base = withoutHash.slice(0, queryIndex);
+  const queryString = withoutHash.slice(queryIndex + 1);
+  const nextQuery = queryString
+    .split('&')
+    .filter(Boolean)
+    .filter((entry) => decodeQueryKey(entry.split('=', 1)[0] ?? '').toLowerCase() !== key.toLowerCase())
+    .join('&');
+  const nextWithoutHash = nextQuery ? `${base}?${nextQuery}` : base;
+  return hash ? `${nextWithoutHash}#${hash}` : nextWithoutHash;
+}
+
+function removeQueryParam(request: JsonRecord, key: string): void {
+  const url = request.url;
+  if (typeof url === 'string') {
+    request.url = removeRawUrlQueryParam(url, key);
+    return;
+  }
+
+  const urlRecord = asRecord(url);
+  if (!urlRecord) {
+    return;
+  }
+
+  if (typeof urlRecord.raw === 'string') {
+    urlRecord.raw = removeRawUrlQueryParam(urlRecord.raw, key);
+  }
+  if (Array.isArray(urlRecord.query)) {
+    urlRecord.query = urlRecord.query.filter((entry) => {
+      const query = asRecord(entry);
+      return !query || typeof query.key !== 'string' || query.key.toLowerCase() !== key.toLowerCase();
+    });
+  }
+}
+
+function getOAuthVariableNames(authConfig: SmokeOAuthConfig): Required<NonNullable<SmokeOAuthConfig['variables']>> {
   return {
     tokenUrl: authConfig.variables?.tokenUrl || 'auth_token_url',
     scope: authConfig.variables?.scope || 'auth_scope',
@@ -224,8 +308,43 @@ function getAuthVariableNames(authConfig: SmokeAuthConfig): Required<NonNullable
   };
 }
 
-function setRequestBearerAuth(request: JsonRecord, authConfig: SmokeAuthConfig): void {
-  const variables = getAuthVariableNames(authConfig);
+function isOAuthAuthConfig(authConfig: SmokeAuthConfig): authConfig is SmokeOAuthConfig {
+  return authConfig.type === 'oauth2';
+}
+
+function getApiKeyVariableName(authConfig: SmokeApiKeyConfig): string {
+  return authConfig.variables?.apiKey?.trim() || 'api_key';
+}
+
+function getApiKeyName(authConfig: SmokeApiKeyConfig): string {
+  return authConfig.name.trim();
+}
+
+function createApiKeyAuth(authConfig: SmokeApiKeyConfig): JsonRecord {
+  return {
+    type: 'apikey',
+    apikey: [
+      {
+        key: 'key',
+        value: getApiKeyName(authConfig),
+        type: 'string'
+      },
+      {
+        key: 'value',
+        value: `{{${getApiKeyVariableName(authConfig)}}}`,
+        type: 'string'
+      },
+      {
+        key: 'in',
+        value: authConfig.in,
+        type: 'string'
+      }
+    ]
+  };
+}
+
+function setRequestBearerAuth(request: JsonRecord, authConfig: SmokeOAuthConfig): void {
+  const variables = getOAuthVariableNames(authConfig);
   request.auth = {
     type: 'bearer',
     bearer: [
@@ -239,16 +358,30 @@ function setRequestBearerAuth(request: JsonRecord, authConfig: SmokeAuthConfig):
   removeHeader(request, authConfig.apply?.header || 'Authorization');
 }
 
+function prepareRequestForCollectionApiKeyAuth(request: JsonRecord, authConfig: SmokeApiKeyConfig): void {
+  const apiKeyName = getApiKeyName(authConfig);
+  delete request.auth;
+  if (authConfig.in === 'header') {
+    removeHeader(request, apiKeyName);
+  } else {
+    removeQueryParam(request, apiKeyName);
+  }
+}
+
 function applyAuthToRequest(request: JsonRecord, authConfig: SmokeAuthConfig | undefined): boolean {
   if (!authConfig?.enabled) {
     return false;
   }
 
-  setRequestBearerAuth(request, authConfig);
+  if (isOAuthAuthConfig(authConfig)) {
+    setRequestBearerAuth(request, authConfig);
+  } else {
+    prepareRequestForCollectionApiKeyAuth(request, authConfig);
+  }
   return true;
 }
 
-function upsertCollectionVariable(collection: JsonRecord, key: string, value = ''): void {
+function upsertCollectionVariable(collection: JsonRecord, key: string, value = '', replaceExisting = false): void {
   const variables = Array.isArray(collection.variable)
     ? collection.variable
         .map((entry) => asRecord(entry))
@@ -256,7 +389,7 @@ function upsertCollectionVariable(collection: JsonRecord, key: string, value = '
     : [];
   const existing = variables.find((entry) => entry.key === key);
   if (existing) {
-    if (typeof existing.value !== 'string') {
+    if (replaceExisting || typeof existing.value !== 'string') {
       existing.value = value;
     }
   } else {
@@ -265,15 +398,21 @@ function upsertCollectionVariable(collection: JsonRecord, key: string, value = '
   collection.variable = variables;
 }
 
-function seedOAuthCollectionVariables(collection: JsonRecord, authConfig: SmokeAuthConfig): void {
-  const variables = getAuthVariableNames(authConfig);
+function seedOAuthCollectionVariables(collection: JsonRecord, authConfig: SmokeOAuthConfig): void {
+  const variables = getOAuthVariableNames(authConfig);
   const tokenUrlValue = authConfig.tokenUrl.includes('{{') ? '' : authConfig.tokenUrl;
   upsertCollectionVariable(collection, variables.tokenUrl, tokenUrlValue);
   upsertCollectionVariable(collection, variables.scope);
   upsertCollectionVariable(collection, variables.clientId);
-  upsertCollectionVariable(collection, variables.clientSecret);
-  upsertCollectionVariable(collection, variables.accessToken);
-  upsertCollectionVariable(collection, variables.expiresAt);
+  // Never carry credentials or token-cache state from a source/canonical
+  // collection into the transformed collection or its optional debug dump.
+  upsertCollectionVariable(collection, variables.clientSecret, '', true);
+  upsertCollectionVariable(collection, variables.accessToken, '', true);
+  upsertCollectionVariable(collection, variables.expiresAt, '', true);
+}
+
+function seedApiKeyCollectionVariables(collection: JsonRecord, authConfig: SmokeApiKeyConfig): void {
+  upsertCollectionVariable(collection, getApiKeyVariableName(authConfig), '', true);
 }
 
 function getScriptExecText(event: JsonRecord): string {
@@ -297,15 +436,26 @@ function applyCollectionAuth(collection: JsonRecord, authConfig: SmokeAuthConfig
     return;
   }
 
-  seedOAuthCollectionVariables(collection, authConfig);
   const existingEvents = Array.isArray(collection.event) ? collection.event : [];
-  collection.event = [
-    ...existingEvents
-      .map((entry) => asRecord(entry))
-      .filter((entry): entry is JsonRecord => Boolean(entry))
-      .filter((entry) => !isGeneratedOAuthEvent(entry)),
-    createOAuthPreRequestEvent(authConfig)
-  ];
+  const retainedEvents = existingEvents
+    .map((entry) => asRecord(entry))
+    .filter((entry): entry is JsonRecord => Boolean(entry))
+    .filter((entry) => !isGeneratedOAuthEvent(entry));
+
+  if (isOAuthAuthConfig(authConfig)) {
+    collection.auth = { type: 'noauth' };
+    seedOAuthCollectionVariables(collection, authConfig);
+    collection.event = [...retainedEvents, createOAuthPreRequestEvent(authConfig)];
+    return;
+  }
+
+  collection.auth = createApiKeyAuth(authConfig);
+  seedApiKeyCollectionVariables(collection, authConfig);
+  if (retainedEvents.length > 0) {
+    collection.event = retainedEvents;
+  } else {
+    delete collection.event;
+  }
 }
 
 function applyAuthToCollectionItems(items: unknown, authConfig: SmokeAuthConfig): number {
@@ -321,8 +471,10 @@ function applyAuthToCollectionItems(items: unknown, authConfig: SmokeAuthConfig)
 
     let nextCount = count;
     const request = asRecord(item.request);
-    const itemName = typeof item.name === 'string' ? item.name : '';
-    if (request && itemName !== LEGACY_SECRETS_RESOLVER_ITEM_NAME && applyAuthToRequest(request, authConfig)) {
+    // The resolver item keeps its AWSv4 auth: matching by isSecretsResolverItem
+    // covers name aliases and the awsv4/secretsmanager heuristic, so target-API
+    // credentials are never applied to (or leak toward) the AWS endpoint.
+    if (request && !isSecretsResolverItem(item) && applyAuthToRequest(request, authConfig)) {
       nextCount += 1;
     }
 
@@ -345,6 +497,151 @@ function getRequestUrlText(request: JsonRecord): string {
   const host = Array.isArray(urlRecord.host) ? urlRecord.host.map(String).join('.') : '';
   const path = Array.isArray(urlRecord.path) ? urlRecord.path.map(String).join('/') : '';
   return [host, path].filter(Boolean).join('/');
+}
+
+function normalizeMatchText(value: unknown): string {
+  return String(value ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function getRequestMethod(request: JsonRecord): string {
+  return normalizeMatchText(request.method || 'GET');
+}
+
+function getRequestUrlMatchKey(item: JsonRecord): string {
+  const request = asRecord(item.request);
+  if (!request) {
+    return '';
+  }
+  const url = normalizeMatchText(getRequestUrlText(request));
+  return url ? `${getRequestMethod(request)} ${url}` : '';
+}
+
+function getRequestNameMatchKey(item: JsonRecord): string {
+  const request = asRecord(item.request);
+  if (!request) {
+    return '';
+  }
+  const name = normalizeMatchText(item.name);
+  return name ? `${getRequestMethod(request)} ${name}` : '';
+}
+
+function getRequestEvents(item: JsonRecord): JsonRecord[] {
+  return Array.isArray(item.event)
+    ? item.event.map((entry) => asRecord(entry)).filter((entry): entry is JsonRecord => Boolean(entry))
+    : [];
+}
+
+function indexUniqueRequestEvents(items: JsonRecord[], getKey: (item: JsonRecord) => string): Map<string, JsonRecord[]> {
+  const matches = new Map<string, JsonRecord[][]>();
+  for (const item of items) {
+    const events = getRequestEvents(item);
+    if (events.length === 0) {
+      continue;
+    }
+    const key = getKey(item);
+    if (!key) {
+      continue;
+    }
+    const existing = matches.get(key) ?? [];
+    existing.push(events);
+    matches.set(key, existing);
+  }
+
+  const unique = new Map<string, JsonRecord[]>();
+  for (const [key, eventSets] of matches) {
+    if (eventSets.length === 1) {
+      unique.set(key, eventSets[0]!);
+    }
+  }
+  return unique;
+}
+
+function mergeRequestEvents(targetEvents: JsonRecord[], sourceEvents: JsonRecord[]): JsonRecord[] {
+  const merged = [...targetEvents];
+  const seen = new Set(targetEvents.map((event) => `${String(event.listen ?? '')}\n${getScriptExecText(event)}`));
+  for (const event of sourceEvents) {
+    const key = `${String(event.listen ?? '')}\n${getScriptExecText(event)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(structuredClone(event) as JsonRecord);
+  }
+  return merged;
+}
+
+function preserveRequestEventsFromCollection(collection: JsonRecord, scriptSourceCollection: JsonRecord | undefined): void {
+  if (!scriptSourceCollection) {
+    return;
+  }
+
+  const sourceItems = collectSmokeRequestItems(scriptSourceCollection.item);
+  const eventsByUrl = indexUniqueRequestEvents(sourceItems, getRequestUrlMatchKey);
+  const eventsByName = indexUniqueRequestEvents(sourceItems, getRequestNameMatchKey);
+  for (const item of collectSmokeRequestItems(collection.item)) {
+    const sourceEvents = eventsByUrl.get(getRequestUrlMatchKey(item)) ?? eventsByName.get(getRequestNameMatchKey(item));
+    if (!sourceEvents || sourceEvents.length === 0) {
+      continue;
+    }
+    const mergedEvents = mergeRequestEvents(getRequestEvents(item), sourceEvents);
+    if (mergedEvents.length > 0) {
+      item.event = mergedEvents;
+    }
+  }
+}
+
+/**
+ * Carry the canonical Smoke collection's identity fields onto a rebuilt body.
+ *
+ * Bootstrap elects the canonical Smoke final by exact `info.name`; this package
+ * previously broke election by PATCHing `/name` to the flow-derived title.
+ * `info.name` is therefore the operative field and must survive the rebuild.
+ * `info.description` is carried forward defensively — the root PATCH never
+ * writes it, so the marker is preserved simply by never being touched, whether
+ * or not the read snapshot surfaces it. Absent canonical fields stay absent.
+ */
+function applyCanonicalCollectionIdentity(
+  collection: JsonRecord,
+  canonicalCollection: JsonRecord | undefined
+): void {
+  if (!canonicalCollection) {
+    return;
+  }
+  const canonicalInfo = asRecord(canonicalCollection.info);
+  if (!canonicalInfo) {
+    return;
+  }
+
+  const info = asRecord(collection.info) ?? {};
+  const canonicalName = typeof canonicalInfo.name === 'string' ? canonicalInfo.name.trim() : '';
+  if (canonicalName) {
+    info.name = canonicalName;
+  }
+  const canonicalDescription = canonicalInfo.description;
+  if (typeof canonicalDescription === 'string' || asRecord(canonicalDescription)) {
+    info.description = canonicalDescription;
+  } else {
+    delete info.description;
+  }
+  collection.info = info;
+}
+
+/**
+ * The shared factory omits `script.type`, which the pre-provider AWS helper
+ * always carried. Stamp it back on so the injected item keeps the historical
+ * wire shape and matches every other script this action emits.
+ */
+function buildSecretsResolverItem(provider: SecretsResolverProvider): JsonRecord {
+  const item = createSecretsResolverItem(provider) as JsonRecord;
+  const events = Array.isArray(item.event) ? item.event : [];
+  for (const entry of events) {
+    const event = asRecord(entry);
+    const script = asRecord(event?.script);
+    if (script && typeof script.type !== 'string') {
+      script.type = 'text/javascript';
+    }
+  }
+  return item;
 }
 
 function isSecretsResolverItem(item: JsonRecord): boolean {
@@ -370,7 +667,15 @@ function isSecretsResolverItem(item: JsonRecord): boolean {
       String(entry.value ?? '').toLowerCase().includes('secretsmanager.getsecretvalue')
   );
 
-  return authType === 'awsv4' && (urlText.includes('secretsmanager') || hasSecretsManagerTarget);
+  const isAwsShape = authType === 'awsv4' && (urlText.includes('secretsmanager') || hasSecretsManagerTarget);
+  // Bearer-token providers: match the vault/secret-manager endpoints so a
+  // renamed helper is still detected instead of being treated as an API
+  // operation (duplicated on rebuild, stripped-check missed, auth overwritten).
+  const isAzureShape = authType === 'bearer' && urlText.includes('vault.azure.net');
+  const isGcpShape =
+    authType === 'bearer' && urlText.includes('secretmanager.googleapis.com') && urlText.includes(':access');
+
+  return isAwsShape || isAzureShape || isGcpShape;
 }
 
 function removeSecretsResolverItems(items: unknown): unknown {
@@ -409,12 +714,38 @@ function containsSecretsResolverItem(items: unknown): boolean {
   });
 }
 
+function collectSmokeRequestItems(items: unknown): JsonRecord[] {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items.flatMap((entry) => {
+    const item = asRecord(entry);
+    if (!item) {
+      return [];
+    }
+
+    const nestedItems = collectSmokeRequestItems(item.item);
+    const request = asRecord(item.request);
+    if (!request || isSecretsResolverItem(item)) {
+      return nestedItems;
+    }
+
+    return [item, ...nestedItems];
+  });
+}
+
 function hasGeneratedOAuthEvent(collection: JsonRecord): boolean {
   const events = Array.isArray(collection.event) ? collection.event : [];
   return events
     .map((entry) => asRecord(entry))
     .filter((entry): entry is JsonRecord => Boolean(entry))
     .some((entry) => isGeneratedOAuthEvent(entry));
+}
+
+function hasCollectionAuth(collection: JsonRecord): boolean {
+  const auth = asRecord(collection.auth);
+  return Boolean(auth && typeof auth.type === 'string' && auth.type !== '' && auth.type !== 'noauth');
 }
 
 function getCollectionVariableKeys(collection: JsonRecord): Set<string> {
@@ -440,12 +771,12 @@ function requestUsesBearerAuth(request: JsonRecord, accessTokenVariable: string)
     .some((entry) => entry.key === 'token' && entry.value === `{{${accessTokenVariable}}}`);
 }
 
-function countBearerAuthRequests(items: unknown, authConfig: SmokeAuthConfig): number {
+function countBearerAuthRequests(items: unknown, authConfig: SmokeOAuthConfig): number {
   if (!Array.isArray(items)) {
     return 0;
   }
 
-  const variables = getAuthVariableNames(authConfig);
+  const variables = getOAuthVariableNames(authConfig);
   return items.reduce((count, entry) => {
     const item = asRecord(entry);
     if (!item) {
@@ -459,6 +790,47 @@ function countBearerAuthRequests(items: unknown, authConfig: SmokeAuthConfig): n
     }
     return nextCount + countBearerAuthRequests(item.item, authConfig);
   }, 0);
+}
+
+function authUsesApiKey(auth: JsonRecord | null, authConfig: SmokeApiKeyConfig): boolean {
+  if (!auth || auth.type !== 'apikey') {
+    return false;
+  }
+  const apiKey = Array.isArray(auth.apikey) ? auth.apikey : [];
+  const entries = apiKey.map((entry) => asRecord(entry)).filter((entry): entry is JsonRecord => Boolean(entry));
+  const valueVariable = getApiKeyVariableName(authConfig);
+  const credentialByKey = new Map(entries.map((entry) => [String(entry.key ?? ''), entry.value]));
+  return (
+    credentialByKey.get('key') === getApiKeyName(authConfig) &&
+    credentialByKey.get('value') === `{{${valueVariable}}}` &&
+    String(credentialByKey.get('in') ?? '').toLowerCase() === authConfig.in
+  );
+}
+
+function collectionUsesApiKeyAuth(collection: JsonRecord, authConfig: SmokeApiKeyConfig): boolean {
+  return authUsesApiKey(asRecord(collection.auth), authConfig);
+}
+
+function collectRequestsWithExplicitAuth(items: unknown): string[] {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items.flatMap((entry) => {
+    const item = asRecord(entry);
+    if (!item) {
+      return [];
+    }
+
+    const nested = collectRequestsWithExplicitAuth(item.item);
+    const request = asRecord(item.request);
+    const auth = asRecord(request?.auth);
+    if (!request || isSecretsResolverItem(item) || !auth || auth.type === 'noauth') {
+      return nested;
+    }
+
+    return [String(item.name ?? '<unnamed request>'), ...nested];
+  });
 }
 
 function getTopLevelItems(collection: JsonRecord): JsonRecord[] {
@@ -479,30 +851,103 @@ function hasFlowRequestScripts(item: JsonRecord): boolean {
 export function verifySmokeCollectionAuth(
   collection: JsonRecord,
   authConfig: SmokeAuthConfig,
-  options: { secretsResolverEnabled?: boolean } = {}
+  options: { secretsResolverProvider?: SecretsResolverProvider } = {}
 ): CollectionVerification {
-  const variables = getAuthVariableNames(authConfig);
   const variableKeys = getCollectionVariableKeys(collection);
-  const missingVariables = Object.values(variables).filter((variableName) => !variableKeys.has(variableName));
-  const bearerAuthRequestCount = countBearerAuthRequests(collection.item, authConfig);
   const failures: string[] = [];
 
-  if (!hasGeneratedOAuthEvent(collection)) {
-    failures.push('missing generated OAuth pre-request script');
+  if (isOAuthAuthConfig(authConfig)) {
+    const variables = getOAuthVariableNames(authConfig);
+    const missingVariables = Object.values(variables).filter((variableName) => !variableKeys.has(variableName));
+    const bearerAuthRequestCount = countBearerAuthRequests(collection.item, authConfig);
+    if (hasCollectionAuth(collection)) {
+      failures.push('collection-level auth is still present while OAuth request auth is enabled');
+    }
+    if (!hasGeneratedOAuthEvent(collection)) {
+      failures.push('missing generated OAuth pre-request script');
+    }
+    if (missingVariables.length > 0) {
+      failures.push(`missing OAuth collection variable(s): ${missingVariables.join(', ')}`);
+    }
+    if (bearerAuthRequestCount === 0) {
+      failures.push('no requests use generated bearer auth');
+    }
+    if (!isSecretsResolverEnabled(options.secretsResolverProvider ?? 'none') && containsSecretsResolverItem(collection.item)) {
+      failures.push('secrets resolver request is still present');
+    }
+
+    return {
+      ok: failures.length === 0,
+      summary: failures.length > 0 ? failures.join('; ') : `OAuth persisted on ${bearerAuthRequestCount} request(s)`
+    };
   }
-  if (missingVariables.length > 0) {
-    failures.push(`missing OAuth collection variable(s): ${missingVariables.join(', ')}`);
+
+  const apiKeyVariable = getApiKeyVariableName(authConfig);
+  const inheritedRequestCount = collectSmokeRequestItems(collection.item).length;
+  const requestsWithExplicitAuth = collectRequestsWithExplicitAuth(collection.item);
+  if (!variableKeys.has(apiKeyVariable)) {
+    failures.push(`missing API key collection variable: ${apiKeyVariable}`);
   }
-  if (bearerAuthRequestCount === 0) {
-    failures.push('no requests use generated bearer auth');
+  if (!collectionUsesApiKeyAuth(collection, authConfig)) {
+    failures.push('missing collection-level API key auth');
   }
-  if (options.secretsResolverEnabled === false && containsSecretsResolverItem(collection.item)) {
+  if (inheritedRequestCount === 0) {
+    failures.push('no requests inherit generated API key auth');
+  }
+  if (requestsWithExplicitAuth.length > 0) {
+    const sample = requestsWithExplicitAuth.slice(0, 5).join(', ');
+    const suffix = requestsWithExplicitAuth.length > 5 ? `, and ${requestsWithExplicitAuth.length - 5} more` : '';
+    failures.push(`request(s) override collection-level API key auth: ${sample}${suffix}`);
+  }
+  if (!isSecretsResolverEnabled(options.secretsResolverProvider ?? 'none') && containsSecretsResolverItem(collection.item)) {
     failures.push('secrets resolver request is still present');
   }
 
   return {
     ok: failures.length === 0,
-    summary: failures.length > 0 ? failures.join('; ') : `OAuth persisted on ${bearerAuthRequestCount} request(s)`
+    summary: failures.length > 0 ? failures.join('; ') : `API key auth persisted at collection level for ${inheritedRequestCount} request(s)`
+  };
+}
+
+export function verifyGeneratedSmokeCollection(
+  collection: JsonRecord,
+  authConfig: SmokeAuthConfig | undefined,
+  options: { secretsResolverProvider?: SecretsResolverProvider } = {}
+): CollectionVerification {
+  const requestItems = collectSmokeRequestItems(collection.item);
+  const requestsMissingUrls = requestItems
+    .filter((item) => {
+      const request = asRecord(item.request);
+      return !request || !getRequestUrlText(request).trim();
+    })
+    .map((item) => String(item.name ?? '<unnamed request>'));
+  const failures: string[] = [];
+
+  if (requestItems.length === 0) {
+    failures.push('no Smoke requests found in generated collection');
+  }
+  if (requestsMissingUrls.length > 0) {
+    const sample = requestsMissingUrls.slice(0, 5).join(', ');
+    const suffix = requestsMissingUrls.length > 5 ? `, and ${requestsMissingUrls.length - 5} more` : '';
+    failures.push(`generated Smoke request(s) missing URL: ${sample}${suffix}`);
+  }
+  if (!authConfig?.enabled && !isSecretsResolverEnabled(options.secretsResolverProvider ?? 'none') && containsSecretsResolverItem(collection.item)) {
+    failures.push('secrets resolver request is still present');
+  }
+  if (isSecretsResolverEnabled(options.secretsResolverProvider ?? 'none') && !containsSecretsResolverItem(collection.item)) {
+    failures.push('secrets resolver request is missing for the selected secrets-resolver provider');
+  }
+
+  if (authConfig?.enabled) {
+    const authVerification = verifySmokeCollectionAuth(collection, authConfig, options);
+    if (!authVerification.ok) {
+      failures.push(authVerification.summary);
+    }
+  }
+
+  return {
+    ok: failures.length === 0,
+    summary: failures.length > 0 ? failures.join('; ') : `generated Smoke collection persisted with ${requestItems.length} request(s)`
   };
 }
 
@@ -510,7 +955,7 @@ export function verifyCuratedSmokeCollection(
   collection: JsonRecord,
   flow: FlowDefinition,
   authConfig: SmokeAuthConfig | undefined,
-  options: { secretsResolverEnabled?: boolean } = {}
+  options: { secretsResolverProvider?: SecretsResolverProvider } = {}
 ): CollectionVerification {
   const topLevelItems = getTopLevelItems(collection);
   const requestItems = topLevelItems.filter((item) => asRecord(item.request) && !isSecretsResolverItem(item));
@@ -533,10 +978,10 @@ export function verifyCuratedSmokeCollection(
   }
 
   const hasSecretsResolver = containsSecretsResolverItem(collection.item);
-  if (options.secretsResolverEnabled === false && hasSecretsResolver) {
+  if (!isSecretsResolverEnabled(options.secretsResolverProvider ?? 'none') && hasSecretsResolver) {
     failures.push('secrets resolver request is still present');
   }
-  if (options.secretsResolverEnabled !== false && !hasSecretsResolver) {
+  if (isSecretsResolverEnabled(options.secretsResolverProvider ?? 'none') && !hasSecretsResolver) {
     failures.push('secrets resolver request is missing');
   }
 
@@ -569,10 +1014,13 @@ function curateRequestItem(resolved: ResolvedRequest, authConfig?: SmokeAuthConf
 export function applySmokeCollectionAuth(
   existingCollection: JsonRecord,
   authConfig: SmokeAuthConfig,
-  options: { secretsResolverEnabled?: boolean } = {}
+  options: { secretsResolverProvider?: SecretsResolverProvider } = {}
 ): { collection: JsonRecord; authRequestCount: number } {
   const collection = sanitizeForCollectionUpdate(structuredClone(existingCollection)) as JsonRecord;
-  if (options.secretsResolverEnabled === false) {
+  // Auth-only path: only an EXPLICIT opt-out removes a resolver the caller
+  // already has. Leaving this on the 'none' default would silently strip the
+  // helper out of every existing collection on the next auth refresh.
+  if (options.secretsResolverProvider === 'none') {
     collection.item = removeSecretsResolverItems(collection.item);
   }
   applyCollectionAuth(collection, authConfig);
@@ -583,21 +1031,61 @@ export function applySmokeCollectionAuth(
   };
 }
 
+export function buildGeneratedSmokeCollection(
+  generatedCollection: JsonRecord,
+  authConfig?: SmokeAuthConfig,
+  options: GeneratedSmokeCollectionBuildOptions = {}
+): { collection: JsonRecord; authRequestCount: number; requestCount: number } {
+  const collection = sanitizeForCollectionUpdate(structuredClone(generatedCollection)) as JsonRecord;
+  if (options.collectionName) {
+    const info = asRecord(collection.info) ?? {};
+    info.name = options.collectionName;
+    collection.info = info;
+  }
+  applyCanonicalCollectionIdentity(collection, options.canonicalCollection);
+  if (!isSecretsResolverEnabled(options.secretsResolverProvider ?? 'none')) {
+    collection.item = removeSecretsResolverItems(collection.item);
+  } else if (!containsSecretsResolverItem(collection.item)) {
+    // Opt-in contract (action.yml secrets-resolver defaults to none): when a
+    // provider IS selected the helper leads the generated collection even if
+    // the generator did not emit one.
+    const items = Array.isArray(collection.item) ? collection.item : [];
+    collection.item = [buildSecretsResolverItem(options.secretsResolverProvider ?? 'none'), ...items];
+  }
+  preserveRequestEventsFromCollection(collection, options.scriptSourceCollection);
+
+  let authRequestCount = 0;
+  if (authConfig?.enabled) {
+    applyCollectionAuth(collection, authConfig);
+    authRequestCount = applyAuthToCollectionItems(collection.item, authConfig);
+  }
+
+  return {
+    collection: sanitizeForCollectionUpdate(collection) as JsonRecord,
+    authRequestCount,
+    requestCount: collectSmokeRequestItems(collection.item).length
+  };
+}
+
 export function buildCuratedSmokeCollection(
   generatedCollection: JsonRecord,
   flow: FlowDefinition,
   resolvedRequests: ResolvedRequest[],
   authConfig?: SmokeAuthConfig,
-  secretsResolverEnabled = true
+  secretsResolverProvider: SecretsResolverProvider = 'none',
+  options: { canonicalCollection?: JsonRecord } = {}
 ): { collection: JsonRecord; bindingCount: number; extractCount: number; assertionCount: number } {
   const collection = sanitizeForCollectionUpdate(structuredClone(generatedCollection)) as JsonRecord;
   const info = asRecord(collection.info);
   if (info) {
     info.name = `[Smoke] ${flow.name}`;
   }
+  applyCanonicalCollectionIdentity(collection, options.canonicalCollection);
   applyCollectionAuth(collection, authConfig);
   const requestItems = resolvedRequests.map((request) => curateRequestItem(request, authConfig));
-  collection.item = secretsResolverEnabled ? [createSecretsResolverItem(), ...requestItems] : requestItems;
+  collection.item = isSecretsResolverEnabled(secretsResolverProvider)
+    ? [buildSecretsResolverItem(secretsResolverProvider), ...requestItems]
+    : requestItems;
   const sanitizedCollection = sanitizeForCollectionUpdate(collection) as JsonRecord;
 
   const bindingCount = flow.steps.reduce((sum, step) => sum + step.bindings.length, 0);

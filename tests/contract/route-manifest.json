@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "routes": [
+    {
+      "id": "collection.delete-collection",
+      "service": "collection",
+      "method": "DELETE",
+      "path": "/v3/collections/{param}",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "collection.delete-item",
+      "service": "collection",
+      "method": "DELETE",
+      "path": "/v3/collections/{param}/items/{param}",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "collection.get-collection",
+      "service": "collection",
+      "method": "GET",
+      "path": "/v3/collections/{param}",
+      "classification": "live-only",
+      "reason": "Name fallback for an owner-prefixed uid the workspace inventory has not surfaced yet; the cassette scenario resolves every name from inventory."
+    },
+    {
+      "id": "sync.get-populated-collection",
+      "service": "sync",
+      "method": "GET",
+      "path": "/collection/{param}",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "collection.get-item",
+      "service": "collection",
+      "method": "GET",
+      "path": "/v3/collections/{param}/items/{param}",
+      "classification": "live-only",
+      "reason": "The cassette scenario creates new items and does not exercise item read-back; focused reconciliation tests cover ambiguous patch recovery."
+    },
+    {
+      "id": "collection.list-items",
+      "service": "collection",
+      "method": "GET",
+      "path": "/v3/collections/{param}/items",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "collection.list-workspace-collections",
+      "service": "collection",
+      "method": "GET",
+      "path": "/v3/collections",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "collection.patch-item",
+      "service": "collection",
+      "method": "PATCH",
+      "path": "/v3/collections/{param}/items/{param}",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "collection.patch-collection",
+      "service": "collection",
+      "method": "PATCH",
+      "path": "/v3/collections/{param}",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "collection.create-item",
+      "service": "collection",
+      "method": "POST",
+      "path": "/v3/collections/{param}/items",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "app-version.get-update-status",
+      "service": "dl.pstmn.io",
+      "method": "GET",
+      "path": "/update/status",
+      "classification": "intentionally-unsimulated",
+      "reason": "The non-critical memoized app-version probe is disabled in deterministic tests so test order cannot alter the observed wire surface."
+    },
+    {
+      "id": "iapub.get-current-session",
+      "service": "iapub",
+      "method": "GET",
+      "path": "/api/sessions/current",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "postman-api.mint-service-account-token",
+      "service": "postman-api",
+      "method": "POST",
+      "path": "/service-account-tokens",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "specification.list-generation-tasks",
+      "service": "specification",
+      "method": "GET",
+      "path": "/tasks",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "specification.list-collections",
+      "service": "specification",
+      "method": "GET",
+      "path": "/specifications/{param}/collections",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    },
+    {
+      "id": "specification.generate-collection",
+      "service": "specification",
+      "method": "POST",
+      "path": "/specifications/{param}/collections",
+      "classification": "simulated",
+      "cassettes": ["tests/contract/cassettes/smoke-flow-wire.json"]
+    }
+  ]
+}

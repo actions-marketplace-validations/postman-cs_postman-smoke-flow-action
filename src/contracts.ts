@@ -1,14 +1,18 @@
 export const smokeFlowActionContract = {
   inputs: {
+    'working-directory': { required: false, default: '' },
     'project-name': { required: true },
     'workspace-id': { required: true },
     'spec-id': { required: true },
     'smoke-collection-id': { required: true },
     'flow-path': { required: false },
-    'postman-api-key': { required: true },
+    'flow-mode': { required: false, default: 'auto' },
+    'flow-allow-delete': { required: false, default: 'false' },
+    'postman-api-key': { required: false },
     'postman-region': { required: false, default: 'us' },
     'auth-config-json': { required: false },
-    'secrets-resolver-enabled': { required: false, default: 'true' },
+    'secrets-resolver': { required: false, default: 'none' },
+    'secrets-resolver-enabled': { required: false },
     'spec-path': { required: false },
     'debug-dump-path': { required: false },
     'collection-sync-mode': { required: false, default: 'refresh' },
@@ -16,7 +20,11 @@ export const smokeFlowActionContract = {
     'fail-on-flow-warning': { required: false, default: 'false' },
     'keep-temp-collection-on-failure': { required: false, default: 'false' },
     'temp-collection-prefix': { required: false, default: '[Smoke][Temp]' },
-    'team-id': { required: false }
+    'persist-derived-flow': { required: false, default: 'true' },
+    'team-id': { required: false },
+    'branch-strategy': { required: false, default: 'legacy' },
+    'canonical-branch': { required: false },
+    'channels': { required: false }
   },
   outputs: {
     'smoke-collection-id': {},
@@ -27,6 +35,9 @@ export const smokeFlowActionContract = {
     'resolved-operation-count': {},
     'applied-binding-count': {},
     'applied-extract-count': {},
-    'assertion-count': {}
+    'assertion-count': {},
+    'derived-flow-path': {},
+    'sync-status': {},
+    'branch-decision': {}
   }
 } as const;

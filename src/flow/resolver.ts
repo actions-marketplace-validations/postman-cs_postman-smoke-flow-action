@@ -1,9 +1,6 @@
-import { readFileSync } from 'node:fs';
-
-import { parse } from 'yaml';
-
 import type { FlowDefinition, ResolvedRequest } from '../types.js';
 import { ValidationError } from '../lib/errors.js';
+import { collectOperations, loadSpecDocument } from './derive.js';
 
 type CollectionItem = Record<string, unknown>;
 type OperationMatch = {
@@ -77,15 +74,21 @@ function flattenRequestItems(node: CollectionItem): CollectionItem[] {
   return results;
 }
 
-function matchesOperationId(item: CollectionItem, operationId: string): boolean {
+/**
+ * Match tiers, strongest first. Exact/case-insensitive name and method+path
+ * (when spec-path is provided) are strong signals; a description substring is
+ * weak -- a short operationId can appear inside an unrelated request's
+ * description -- so it only applies when no strong tier matched anywhere in
+ * the collection, and it produces a warning.
+ */
+function matchesByName(item: CollectionItem, operationId: string): boolean {
   const name = getItemName(item);
+  return name === operationId || name.toLowerCase() === operationId.toLowerCase();
+}
+
+function matchesByDescription(item: CollectionItem, operationId: string): boolean {
   const description = getRequestDescription(item);
-  return (
-    name === operationId ||
-    name.toLowerCase() === operationId.toLowerCase() ||
-    description.includes(operationId) ||
-    description.toLowerCase().includes(operationId.toLowerCase())
-  );
+  return description.includes(operationId) || description.toLowerCase().includes(operationId.toLowerCase());
 }
 
 function loadOperationMatches(specPath?: string): Map<string, OperationMatch> {
@@ -93,25 +96,22 @@ function loadOperationMatches(specPath?: string): Map<string, OperationMatch> {
     return new Map();
   }
 
-  const document = parse(readFileSync(specPath, 'utf8')) as Record<string, unknown> | null;
+  const document = loadSpecDocument(specPath);
   const paths = asRecord(document?.paths);
   if (!paths) {
     return new Map();
   }
 
+  // Shared with derivation: same Path Item $ref handling, same synthetic
+  // fallback operationIds, same collision suffixes. A derived step's
+  // operationId therefore ALWAYS has a method+path entry here, even when the
+  // spec omits operationId entirely.
   const operationMatches = new Map<string, OperationMatch>();
-  for (const [specPathKey, pathItem] of Object.entries(paths)) {
-    const pathRecord = asRecord(pathItem);
-    if (!pathRecord) continue;
-    for (const [method, operation] of Object.entries(pathRecord)) {
-      const operationRecord = asRecord(operation);
-      const operationId = typeof operationRecord?.operationId === 'string' ? operationRecord.operationId : '';
-      if (!operationId) continue;
-      operationMatches.set(operationId, {
-        method: method.toUpperCase(),
-        path: normalizePathTemplate(specPathKey)
-      });
-    }
+  for (const operation of collectOperations(document ?? {})) {
+    operationMatches.set(operation.operationId, {
+      method: operation.method,
+      path: normalizePathTemplate(operation.path)
+    });
   }
 
   return operationMatches;
@@ -130,17 +130,30 @@ function matchesOperationByRequestShape(item: CollectionItem, operationMatch?: O
 export function resolveFlowRequests(
   flow: FlowDefinition,
   generatedCollection: CollectionItem,
-  specPath?: string
+  specPath?: string,
+  onWarning?: (message: string) => void
 ): ResolvedRequest[] {
   const requestItems = flattenRequestItems(generatedCollection);
   const operationMatches = loadOperationMatches(specPath);
 
   return flow.steps.map((step) => {
-    const match = requestItems.find(
-      (item) =>
-        matchesOperationId(item, step.operationId) ||
+    // Tiered resolution: exact/case-insensitive name, then method+path from
+    // the spec, then (weak, warned) description substring.
+    let match = requestItems.find((item) => matchesByName(item, step.operationId));
+    if (!match) {
+      match = requestItems.find((item) =>
         matchesOperationByRequestShape(item, operationMatches.get(step.operationId))
-    );
+      );
+    }
+    if (!match) {
+      match = requestItems.find((item) => matchesByDescription(item, step.operationId));
+      if (match) {
+        onWarning?.(
+          `Resolved operationId "${step.operationId}" to request "${getItemName(match)}" only via a description substring match; ` +
+            `verify the flow targets the intended request (name and method+path tiers found no match).`
+        );
+      }
+    }
     if (!match) {
       throw new ValidationError(`Could not resolve operationId "${step.operationId}" in the generated temporary Smoke collection.`);
     }

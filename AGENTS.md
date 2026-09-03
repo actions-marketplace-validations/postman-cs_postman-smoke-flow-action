@@ -1,46 +1,78 @@
 # postman-smoke-flow-action
 
-Reshapes the generated Postman Smoke collection to match a curated `flow.yaml`, with optional OAuth2 token acquisition. Runs as a standalone step that consumes bootstrap's `smoke-collection-id` output. Dual entry: GitHub Action (`dist/main.cjs`) and CLI (`dist/cli.cjs`, bin `postman-smoke-flow`).
+Reshapes generated Postman Smoke collection to match curated `flow.yaml`, w/ optional OAuth2 token acquisition. Runs as standalone step consuming bootstrap's `smoke-collection-id` output. Dual entry: GitHub Action (`dist/main.cjs`) + CLI (`dist/cli.cjs`, bin `postman-smoke-flow`).
 
 ## Structure
 
 ```
 src/
-  index.ts                       # GitHub Action entry: reads inputs, applies flow, sets outputs
-  cli.ts                         # CLI adapter for non-GitHub CI
-  main.ts                        # Core orchestration: load flow.yaml -> transform -> write collection
-  contracts.ts                   # Input/output type definitions
+  index.ts                       # Action entry: reads inputs, applies flow, sets outputs
+  cli.ts                         # CLI adapter
+  main.ts                        # Core: load flow.yaml -> transform -> write collection
+  contracts.ts                   # I/O types
   types.ts                       # Shared flow + collection types
   flow/
     parser.ts                    # Parse curated flow.yaml
-    resolver.ts                  # Resolve flow steps against the generated Smoke collection
-    validator.ts                 # Validate flow shape and references
+    resolver.ts                  # Resolve flow steps against generated Smoke collection
+    validator.ts                 # Validate flow shape + references
   postman/
-    postman-smoke-client.ts      # Postman API client (collection fetch/update)
-    collection-transform.ts      # Reorder/reshape requests to match the flow
-    scripts.ts                   # Injected pre-request/test scripts (chaining, OAuth2)
+    postman-gateway-smoke-client.ts # Live client: generate/read/reshape/delete via access-token gateway
+    postman-smoke-client.ts      # Legacy PMAK client; imported for method types only (Pick<...>), never instantiated
+    collection-transform.ts      # Reorder/reshape requests, seed OAuth vars + per-request bearer auth
+    scripts.ts                   # Injected pre-request/test scripts (chaining, OAuth2 token mint)
+    credential-identity.ts       # iapub session-identity preflight + memoized consumerType for telemetry
   lib/
     cli-args.ts                  # CLI flag parsing
-    errors.ts, error-advice.ts   # Typed errors + user-facing remediation hints
+    errors.ts, error-advice.ts   # ValidationError + user-facing remediation hints
     logging.ts                   # Reporter (stderr logs, stdout JSON in CLI mode)
     paths.ts                     # Path resolution helpers
+    postman/
+      token-provider.ts          # AccessTokenProvider: holds access token, re-mints from PMAK on 401
+  @postman-cs/automation-core   # Shared gateway transport, retry, and HttpError
 tests/
 ```
 
 ## Commands
 
 ```bash
-npm ci && npm test && npm run typecheck && npm run build
-npm run check:dist   # build + git diff --exit-code (CI integrity)
+npm ci
+npm test
+npm run typecheck
+npm run build
+npm run verify:dist:assert  # read-only dist contract (CI)
+npm run verify:dist         # rebuild + git diff + assert
 ```
 
 ## Key Behaviors
 
-- **Flow apply**: Loads the curated `flow.yaml`, resolves each step against the live Smoke collection, and rewrites the collection so request order, chaining, and variables match the flow.
-- **OAuth2 (optional)**: When configured, injects token-acquisition scripts so the smoke run authenticates before exercising endpoints.
-- **Idempotent reshape**: Operates on the existing canonical Smoke collection by id and transforms it in place.
+- **Gateway reshape**: `postman-access-token` required. Temp gets unique run name. Create sends once except when terminal failed generation task leaves run-owned temp that is positively reconciled and deleted before retry. Ambiguous result uses read-back. Canonical must belong to workspace. Item listing flat; parent `items` stubs define direct children. Adoption needs parent + name. Duplicates fail. Cleanup deletes owned temp only. `postman-api-key` only refreshes token.
+- **Flow apply**: Loads curated `flow.yaml`, resolves each step against generated Smoke collection, rewrites canonical collection so request order, chaining, variables match flow.
+- **OAuth2 (optional)**: When configured, seeds collection variables + pre-request script that mints `client_credentials` bearer token, applies token as per-request bearer auth so smoke run authenticates before exercising endpoints.
+- **Idempotent reshape**: Canonical changes in place. API has no cross-process lease. Workflow must use `concurrency` key from canonical collection id.
 
 ## Gotchas
 
-- `main.cjs` is the Action entry (not `index.cjs` as in sibling actions); the CLI is `cli.cjs`. Wire pre-write logic into both.
-- The flow is applied to the collection bootstrap generated; this action assumes that collection already exists (it does not generate one).
+- `main.cjs` = Action entry (not `index.cjs` as in sibling actions); CLI = `cli.cjs`. Wire pre-write logic into both.
+- Flow applied to collection bootstrap generated; this action assumes collection already exists (does not generate one).
+
+## CI
+
+`.github/workflows/ci.yml` bundles once, queues at most two checks on one runner. Typecheck once. Dist read-only `verify:dist:assert`; no pack race. Every check prints `::group::` result even on failure.
+
+See workspace `../../docs/CI.md` for shared rationale.
+
+## Releases
+
+Tags are an **output** of passing run, never input. Never push release tags by hand; `.githooks/pre-push` rejects them.
+
+- `.github/workflows/auto-release.yml` runs on every push to `main` and drives `scripts/release-cut.mjs`.
+- `node scripts/release-cut.mjs --plan` reports pending cut (fetch tags first). `--execute` bumps, rebuilds `dist/`, runs typecheck/lint/test, commits, re-verifies committed bytes, then tags last.
+- Version comes from highest tag ever cut, not `package.json`. Existing tags are burnt and skipped, so failed cut never reuses or rewinds version.
+- Conventional-commit type picks bump; `chore`/`ci`/`build`/`test`/`style` alone cut nothing.
+- release commit lives only on tag. `main` requires pull requests and green `ready` + `build-and-smoke` checks (admins included). Merge with `gh pr checks <n> --watch --fail-fast && gh pr merge <n> --merge --delete-branch`; never `--admin`.
+- `.githooks/pre-push` runs typecheck, lint, and test before every branch push besides dist ratchet.
+- `RELEASE_POLICY.md` holds full contract.
+
+## Anti-Patterns
+
+- Never log, commit, or embed access tokens, PMAKs, or other secrets; mask output via `createSecretMasker()`

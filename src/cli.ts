@@ -1,7 +1,15 @@
-import { applyArgsToEnv } from './lib/cli-args.js';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+
+import {
+  ACKNOWLEDGE_NO_FLOW_REFRESH_FLAG,
+  parseCliArgs
+} from './lib/cli-args.js';
 import { summarizeError } from './lib/logging.js';
-import { readActionInputs, runAction } from './index.js';
+import { resolveActionVersion } from './action-version.js';
+import { DEFAULT_FLOW_PATH, readActionInputs, runAction } from './index.js';
 import type { CoreLike } from './types.js';
+import { activateWorkingDirectory } from './lib/working-directory.js';
 
 const outputs: Record<string, string> = {};
 
@@ -20,15 +28,110 @@ const cliCore: CoreLike = {
   }
 };
 
-async function main(): Promise<void> {
-  const env = { ...process.env };
-  applyArgsToEnv(process.argv, env);
-  readActionInputs(env);
-  await runAction(cliCore, env);
-  process.stdout.write(`${JSON.stringify(outputs, null, 2)}\n`);
+function printHelp(): void {
+  process.stdout.write(`Usage: postman-smoke-flow [options]
+
+Apply a curated flow.yaml to a Postman Smoke collection, or refresh the
+canonical collection from the generated spec collection.
+
+Options mirror action.yml inputs as --kebab-case flags.
+
+Destructive no-flow refresh (omitting --flow-path without spec-path
+derivation under flow-mode auto) requires:
+  --${ACKNOWLEDGE_NO_FLOW_REFRESH_FLAG}
+
+Other:
+  --help       Show this help text and exit
+  --version    Print the package version and exit
+`);
 }
 
-main().catch((error) => {
-  console.error(summarizeError(error));
-  process.exitCode = 1;
-});
+function printVersion(): void {
+  process.stdout.write(`${resolveActionVersion()}\n`);
+}
+
+export function assertCliNoFlowRefreshAllowed(options: {
+  flowPath: string | undefined;
+  flowMode: 'auto' | 'curated' | 'off';
+  specPath: string | undefined;
+  acknowledgeNoFlowRefresh: boolean;
+}): void {
+  const flowPath = options.flowPath?.trim();
+  if (flowPath) {
+    return;
+  }
+  // flow-mode=auto derives (spec-path present) or runs curated from a
+  // manifest already at the conventional default path; neither is the
+  // destructive uncurated refresh, so no acknowledgment is required.
+  if (options.flowMode === 'auto' && (options.specPath?.trim() || defaultFlowManifestExists())) {
+    return;
+  }
+  if (options.acknowledgeNoFlowRefresh) {
+    return;
+  }
+  throw new Error(
+    `Omitting --flow-path without spec-path derivation selects a destructive full canonical Smoke refresh. ` +
+      `Re-run with --flow-path <path>, provide --spec-path under flow-mode auto, or pass --${ACKNOWLEDGE_NO_FLOW_REFRESH_FLAG} to acknowledge.`
+  );
+}
+
+function defaultFlowManifestExists(): boolean {
+  try {
+    return existsSync(path.resolve('.', DEFAULT_FLOW_PATH));
+  } catch {
+    return false;
+  }
+}
+
+export async function runCli(
+  argv: string[] = process.argv,
+  actionCore: CoreLike = cliCore,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<Record<string, string> | void> {
+  const parsed = parseCliArgs(argv, env);
+  if (parsed.kind === 'help') {
+    printHelp();
+    return;
+  }
+  if (parsed.kind === 'version') {
+    printVersion();
+    return;
+  }
+
+  activateWorkingDirectory(parsed.env.INPUT_WORKING_DIRECTORY, process.cwd());
+  const mergedEnv: NodeJS.ProcessEnv = { ...env, ...parsed.env };
+  const inputs = readActionInputs(mergedEnv);
+  assertCliNoFlowRefreshAllowed({
+    flowPath: inputs.flowPath,
+    flowMode: inputs.flowMode,
+    specPath: inputs.specPath,
+    acknowledgeNoFlowRefresh: parsed.acknowledgeNoFlowRefresh
+  });
+
+  // CLI safety checks require the effective service root before runAction. Tell
+  // the shared action path not to resolve the same relative input a second time.
+  await runAction(actionCore, mergedEnv, undefined, undefined, {
+    workingDirectoryAlreadyActivated: true
+  });
+  return outputs;
+}
+
+async function main(): Promise<void> {
+  const result = await runCli(process.argv, cliCore, process.env);
+  if (result) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  }
+}
+
+function shouldRunMain(): boolean {
+  const cjsModule = typeof module !== 'undefined' ? module : undefined;
+  const cjsRequire = typeof require !== 'undefined' ? require : undefined;
+  return Boolean(cjsModule && cjsRequire && cjsRequire.main === cjsModule);
+}
+
+if (shouldRunMain()) {
+  main().catch((error) => {
+    console.error(summarizeError(error));
+    process.exitCode = 1;
+  });
+}

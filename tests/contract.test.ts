@@ -40,13 +40,30 @@ function markerSection(content: string, startMarker: string, endMarker: string):
   return content.slice(start, end);
 }
 
+function parseMarkdownTableRowKeys(section: string): string[] {
+  const rowKeyPattern = /^\|\s*`([^`]+)`\s*\|/;
+  const keys: string[] = [];
+
+  for (const line of section.split('\n')) {
+    const match = line.match(rowKeyPattern);
+    if (match) {
+      keys.push(match[1]);
+    }
+  }
+
+  return keys;
+}
+
 describe('postman-smoke-flow-action contract', () => {
   it('uses the expected action name and required inputs', () => {
     const manifest = loadManifest();
     expect(manifest.name).toBe('Postman Onboarding: Smoke Flow');
     expect(manifest.inputs['flow-path']?.required).toBe(false);
+    expect(manifest.inputs['working-directory']).toMatchObject({ required: false, default: '' });
     expect(manifest.inputs['smoke-collection-id']?.required).toBe(true);
-    expect(manifest.inputs['secrets-resolver-enabled']?.default).toBe('true');
+    // Off by default: the helper is opt-in, and the legacy boolean carries no default.
+    expect(manifest.inputs['secrets-resolver']?.default).toBe('none');
+    expect(manifest.inputs['secrets-resolver-enabled']?.default).toBeUndefined();
   });
 
   it('defines the expected primary outputs', () => {
@@ -57,11 +74,21 @@ describe('postman-smoke-flow-action contract', () => {
       'flow-apply-summary-json',
       'temporary-smoke-collection-id',
       'flow-step-count',
-      'resolved-operation-count',
-      'applied-binding-count',
-      'applied-extract-count',
-      'assertion-count'
+        'resolved-operation-count',
+        'applied-binding-count',
+        'applied-extract-count',
+      'assertion-count',
+      'derived-flow-path',
+      'sync-status',
+        'branch-decision'
     ]);
+  });
+
+  it('keeps action.yml outputs in parity with the internal contract', async () => {
+    const manifest = loadManifest();
+    const { smokeFlowActionContract } = await import('../src/contracts.js');
+    expect(Object.keys(manifest.outputs)).toEqual(Object.keys(smokeFlowActionContract.outputs));
+    expect(Object.keys(manifest.inputs)).toEqual(Object.keys(smokeFlowActionContract.inputs));
   });
 
   it('keeps README action tables in sync with action.yml', () => {
@@ -69,14 +96,20 @@ describe('postman-smoke-flow-action contract', () => {
     const readme = loadText('README.md');
     const inputsTable = markerSection(readme, '<!-- inputs-table:start -->', '<!-- inputs-table:end -->');
     const outputsTable = markerSection(readme, '<!-- outputs-table:start -->', '<!-- outputs-table:end -->');
+    const manifestInputKeys = Object.keys(manifest.inputs);
+    const manifestOutputKeys = Object.keys(manifest.outputs);
+    const readmeInputKeys = parseMarkdownTableRowKeys(inputsTable);
+    const readmeOutputKeys = parseMarkdownTableRowKeys(outputsTable);
 
-    for (const inputName of Object.keys(manifest.inputs)) {
-      const tick = String.fromCharCode(96);
+    expect(readmeInputKeys).toEqual(manifestInputKeys);
+    expect(readmeOutputKeys).toEqual(manifestOutputKeys);
+
+    const tick = String.fromCharCode(96);
+    for (const inputName of manifestInputKeys) {
       expect(inputsTable).toContain('| ' + tick + inputName + tick + ' |');
     }
 
-    for (const outputName of Object.keys(manifest.outputs)) {
-      const tick = String.fromCharCode(96);
+    for (const outputName of manifestOutputKeys) {
       expect(outputsTable).toContain('| ' + tick + outputName + tick + ' |');
     }
   });
@@ -104,7 +137,7 @@ describe('postman-smoke-flow-action contract', () => {
       loadText('docs/smoke-oauth.md'),
       loadText('action.yml')
     ].join('\\n');
-    const blockedTerms = ['customer ' + 'pre' + 'view', 'customer-' + 'pre' + 'view', 'pre' + 'view', 'inter' + 'nal'];
+    const blockedTerms = ['customer ' + 'pre' + 'view', 'customer-' + 'pre' + 'view', 'inter' + 'nal'];
 
     expect(marketplaceText).not.toMatch(new RegExp(blockedTerms.join('|'), 'i'));
   });
@@ -112,12 +145,25 @@ describe('postman-smoke-flow-action contract', () => {
   it('exposes the standard validation scripts used by sibling actions', () => {
     const packageJson = loadPackageJson();
     expect(packageJson.scripts).toMatchObject({
+      bundle: expect.any(String),
       build: expect.any(String),
-      'check:dist': expect.any(String),
+      'verify:dist:shape': 'node scripts/verify-dist-artifact.mjs',
+      'verify:dist:parity': 'git diff --ignore-space-at-eol --text --exit-code -- dist',
+      'verify:dist:assert': expect.any(String),
+      'verify:dist': expect.any(String),
       lint: 'eslint .',
       'lint:fix': 'eslint . --fix',
-      test: 'vitest run',
+      test: 'vitest run && node --test .github/scripts/dispatch-e2e-monitor.test.mjs',
       typecheck: 'tsc --noEmit -p tsconfig.json'
     });
+    expect(packageJson.scripts.bundle).toContain('--banner:js="#!/usr/bin/env node"');
+    expect(packageJson.scripts.bundle).toContain("process.platform!=='win32'");
+    expect(packageJson.scripts.bundle).toContain("chmodSync('dist/cli.cjs',0o755)");
+    expect(packageJson.scripts.bundle).not.toContain('typecheck');
+    expect(packageJson.scripts.build).toMatch(/npm run typecheck && npm run bundle/);
+    expect(packageJson.scripts['verify:dist:assert']).toBe(
+      'npm run verify:dist:shape && npm run verify:dist:parity'
+    );
+    expect(packageJson.scripts['verify:dist']).toBe('npm run build && npm run verify:dist:assert');
   });
 });

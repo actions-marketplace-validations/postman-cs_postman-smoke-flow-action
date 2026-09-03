@@ -1,0 +1,1153 @@
+import { AccessTokenGatewayClient, HttpError } from '@postman-cs/automation-core';
+import { summarizeError } from '../lib/logging.js';
+import type { AccessTokenProvider } from '../lib/postman/token-provider.js';
+import type { PostmanAppVersionProvider } from '../lib/postman/app-version.js';
+import { createSecretMasker, type SecretMasker } from '../lib/secrets.js';
+import {
+  isBareCollectionUuid,
+  isFullPublicCollectionUid,
+  normalizeCollectionModelIdentity
+} from './collection-model-identity.js';
+
+type JsonRecord = Record<string, unknown>;
+type ParentRef = { id: string; $kind: 'collection' };
+type ItemListing = {
+  entries: JsonRecord[];
+  parentByChildId: Map<string, string>;
+};
+
+function asRecord(value: unknown): JsonRecord | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonRecord) : null;
+}
+
+function asArray(value: unknown): JsonRecord[] {
+  return Array.isArray(value) ? value.map(asRecord).filter((v): v is JsonRecord => Boolean(v)) : [];
+}
+
+/** Bare model id for export/delete/sync routes that retain bare-model identity. */
+function bareModelId(uid: string): string {
+  return normalizeCollectionModelIdentity(uid);
+}
+
+/** Collection id for ITEMS routes. Prefer the full public uid. */
+function collectionItemsId(uid: string): string {
+  return String(uid ?? '').trim();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Transient/ambiguous create responses where the server may have accepted the write. */
+function isAmbiguousCreateError(error: unknown): boolean {
+  if (!(error instanceof HttpError)) return true;
+  return error.status === 408 || error.status === 429 || error.status >= 500;
+}
+
+const isAmbiguousMutationError = isAmbiguousCreateError;
+
+/** v2 request url (string or `{raw}`) -> raw string for a v3 create. */
+function v2UrlToRaw(url: unknown): string {
+  if (typeof url === 'string') return url;
+  const record = asRecord(url);
+  if (record && typeof record.raw === 'string') return record.raw;
+  return '';
+}
+
+/**
+ * v2 auth `{type, <type>:[{key,value,...}]}` -> v3 IR `{type, credentials:[{key,value}]}`.
+ * Credentials are `{key,value}` pairs (v3-auth-adapter.ts) — the v2 `type:'string'`
+ * field on each entry is dropped.
+ */
+function v2AuthToV3(auth: JsonRecord | null): JsonRecord | undefined {
+  if (!auth) return undefined;
+  const type = typeof auth.type === 'string' ? auth.type : '';
+  if (!type || type === 'noauth') return undefined;
+  const entries = Array.isArray(auth[type]) ? (auth[type] as unknown[]) : [];
+  const credentials = entries
+    .map(asRecord)
+    .filter((entry): entry is JsonRecord => Boolean(entry))
+    .map((entry) => ({ key: String(entry.key ?? ''), value: entry.value ?? '' }));
+  return { type, credentials };
+}
+
+function isNoAuth(auth: JsonRecord | null): boolean {
+  return auth?.type === 'noauth';
+}
+
+function isMissingPatchValueError(error: unknown): boolean {
+  return (
+    error instanceof HttpError &&
+    error.status === 400 &&
+    error.responseBody.includes('Remove operation must point to an existing value')
+  );
+}
+
+/** Looks-like-JSON heuristic for choosing a v3 body `type` (json vs text). */
+function looksLikeJson(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (!/^[[{]/.test(trimmed)) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** v2 body `{mode:'raw', raw}` -> v3 IR `{type:'json'|'text', content}` (root field on create). */
+function v2BodyToV3(body: JsonRecord | null): JsonRecord | undefined {
+  if (!body) return undefined;
+  if (body.mode !== 'raw' || typeof body.raw !== 'string') return undefined;
+  const raw = body.raw;
+  return { type: looksLikeJson(raw) ? 'json' : 'text', content: raw };
+}
+
+/** v2 header array -> v3 root `headers` (`{key,value}` pairs). */
+function v2HeadersToV3(header: unknown): JsonRecord[] {
+  return asArray(header).map((entry) => ({ key: String(entry.key ?? ''), value: entry.value ?? '' }));
+}
+
+/** v2 `event[]` -> v3 per-item `/scripts` (prerequest->beforeRequest, test->afterResponse). */
+function v2EventsToV3Scripts(events: unknown): JsonRecord[] {
+  return asArray(events)
+    .map((event) => {
+      const listen = typeof event.listen === 'string' ? event.listen : '';
+      const type = listen === 'prerequest' ? 'beforeRequest' : listen === 'test' ? 'afterResponse' : '';
+      if (!type) return null;
+      const script = asRecord(event.script);
+      const exec = Array.isArray(script?.exec) ? script!.exec.map(String) : [];
+      return { type, code: exec.join('\n'), language: 'text/javascript' } as JsonRecord;
+    })
+    .filter((script): script is JsonRecord => Boolean(script));
+}
+
+/**
+ * v2 collection-level `event[]` -> v3 collection-root `/scripts`. The root accepts
+ * only `http:beforeRequest` / `http:afterRequest` (REJECTED_PATCH otherwise), so
+ * the listen names map to the `http:`-prefixed forms (live-observed).
+ */
+function v2EventsToV3CollectionScripts(events: unknown): JsonRecord[] {
+  return asArray(events)
+    .map((event) => {
+      const listen = typeof event.listen === 'string' ? event.listen : '';
+      const type = listen === 'prerequest' ? 'http:beforeRequest' : listen === 'test' ? 'http:afterRequest' : '';
+      if (!type) return null;
+      const script = asRecord(event.script);
+      const exec = Array.isArray(script?.exec) ? script!.exec.map(String) : [];
+      return { type, code: exec.join('\n'), language: 'text/javascript' } as JsonRecord;
+    })
+    .filter((script): script is JsonRecord => Boolean(script));
+}
+
+function itemParentBareId(item: JsonRecord, parentByChildId: ReadonlyMap<string, string>): string | null {
+  const itemId = bareModelId(String(item.id ?? item.uid ?? ''));
+  const stubParent = itemId ? parentByChildId.get(itemId) : undefined;
+  if (stubParent) return stubParent;
+
+  // Stub references are authoritative. Keep position.parent only as a forward-
+  // compatible fallback if a future listing starts returning it on full entries.
+  const raw = asRecord(item.position)?.parent;
+  if (raw === undefined || raw === null || raw === '') return null;
+  if (typeof raw === 'string') return bareModelId(raw);
+  const record = asRecord(raw);
+  if (record && typeof record.id === 'string') return bareModelId(String(record.id));
+  return null;
+}
+
+export interface PostmanGatewaySmokeClientOptions {
+  tokenProvider: AccessTokenProvider;
+  bifrostBaseUrl?: string;
+  teamId?: string;
+  orgMode?: boolean;
+  fetchImpl?: typeof fetch;
+  sleepImpl?: (ms: number) => Promise<void>;
+  now?: () => number;
+  appVersionProvider?: PostmanAppVersionProvider;
+  /** Workspace that must own the canonical collection before any mutate. */
+  workspaceId?: string;
+  /**
+   * Run-owned identity token embedded in temporary collection names so an
+   * ambiguous generate response can be reconciled without adopting a peer run.
+   */
+  runIdentity?: string;
+  /** Optional operator warning sink for best-effort partial-success paths. */
+  warning?: (message: string) => void;
+  /** Optional secret masker for operator-facing warning/error text. */
+  secretMasker?: SecretMasker;
+}
+
+/**
+ * Access-token-only Smoke collection client implementing the
+ * `SmokeCollectionClient` surface (`generateCollection`/`getCollection`/
+ * `updateCollection`/`deleteCollection`) with gateway operations so the reshape
+ * runs without a postman-api-key:
+ *
+ * - generate: `specification POST /specifications/:id/collections` + task poll,
+ *   with run-unique naming, pre-run snapshot correlation, and no blind POST retry.
+ * - read: `sync GET /collection/:uid` (populated v2.1 snapshot, full public uid,
+ *   retry-free, fail-closed on identity/schema mismatch). Collection v3
+ *   `/export` is never used: its projection is unstable for fresh roots.
+ * - update: workspace ownership gate, then deterministic in-place item
+ *   reconciliation by name (fail-closed on duplicates). Folder/request creates
+ *   opt out of blind transport retries and reconcile after ambiguous 5xx.
+ * - delete: only temporary collection IDs positively owned by this run
+ *   (`collection DELETE /v3/collections/:cid`, 404-tolerant).
+ *
+ * Curated flow collections are already flat. No-flow refreshes can pass through
+ * generated collection folders, so update writes the tree recursively to preserve
+ * the generated folder structure.
+ */
+export class PostmanGatewaySmokeClient {
+  private static readonly GENERATION_LOCKED_MAX_RETRIES = 5;
+  private static readonly GENERATION_MAX_ATTEMPTS = 3;
+  private static readonly GENERATION_RETRY_BASE_DELAY_MS = 1000;
+  private static readonly GENERATION_RETRY_MAX_DELAY_MS = 10000;
+  private static readonly GENERATION_POLL_ATTEMPTS = 90;
+  private static readonly GENERATION_POLL_DELAY_MS = 2000;
+  private static readonly GENERATION_POLL_TIMEOUT_MS = 180000;
+  /** Bounded inventory polling when a bare model id must become ROOT-addressable. */
+  private static readonly ROOT_UID_RESOLVE_DELAYS_MS = [250, 500, 750, 1000, 1250] as const;
+
+  private readonly gateway: AccessTokenGatewayClient;
+  private readonly sleepImpl: (ms: number) => Promise<void>;
+  private readonly now: () => number;
+  private readonly workspaceId?: string;
+  private readonly runIdentity?: string;
+  private readonly warning?: (message: string) => void;
+  private readonly secretMasker: SecretMasker;
+  private readonly ownedTemporaryCollectionIds = new Set<string>();
+
+  constructor(options: PostmanGatewaySmokeClientOptions) {
+    this.secretMasker =
+      options.secretMasker ?? createSecretMasker([options.tokenProvider.current()]);
+    this.warning = options.warning;
+    this.gateway = new AccessTokenGatewayClient({
+      tokenProvider: options.tokenProvider,
+      ...(options.bifrostBaseUrl ? { bifrostBaseUrl: options.bifrostBaseUrl } : {}),
+      ...(options.teamId ? { teamId: options.teamId } : {}),
+      ...(options.orgMode !== undefined ? { orgMode: options.orgMode } : {}),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.sleepImpl ? { sleepImpl: options.sleepImpl } : {}),
+      ...(options.appVersionProvider ? { appVersionProvider: options.appVersionProvider } : {}),
+      refreshEmptyToken: false,
+      defaultInnerErrorStatus: 500,
+      classifyInnerAuthError: true,
+      refreshOnInnerAuthError: true,
+      jitterRounding: 'round',
+      secretMasker: this.secretMasker
+    });
+    this.sleepImpl = options.sleepImpl ?? sleep;
+    this.now = options.now ?? Date.now;
+    const workspaceId = String(options.workspaceId ?? '').trim();
+    this.workspaceId = workspaceId || undefined;
+    const runIdentity = String(options.runIdentity ?? '').trim();
+    this.runIdentity = runIdentity || undefined;
+  }
+
+  async generateCollection(specId: string, projectName: string, prefix: string): Promise<string> {
+    let lastError: unknown;
+    for (let generationAttempt = 1; generationAttempt <= PostmanGatewaySmokeClient.GENERATION_MAX_ATTEMPTS; generationAttempt += 1) {
+      const ownedName = this.buildGenerationAttemptName(prefix, projectName, generationAttempt);
+      const body = { name: ownedName, options: { requestNameSource: 'Fallback' } };
+      const preSnapshot = await this.listSpecCollectionUids(specId);
+      let ambiguousCreateUnreconciled = false;
+
+      try {
+        let taskId: string;
+        try {
+          taskId = await this.postGenerationWithLockRetry(specId, body);
+        } catch (error) {
+          if (!isAmbiguousCreateError(error)) {
+            throw error;
+          }
+          const reconciled = await this.reconcileGeneratedCollection(specId, ownedName, preSnapshot);
+          if (!reconciled) {
+            ambiguousCreateUnreconciled = true;
+            throw error;
+          }
+          this.rememberOwnedTemporaryCollection(reconciled);
+          return reconciled;
+        }
+
+        if (taskId) {
+          await this.waitForGenerationTask(specId, taskId);
+        }
+
+        const owned = await this.reconcileGeneratedCollection(specId, ownedName, preSnapshot);
+        if (!owned) {
+          throw new Error(
+            `COLLECTION_GENERATION_RECONCILE_FAILED: Collection generation for spec ${specId} did not yield a run-owned temporary collection named ${ownedName}. Inspect the spec generation/task state and permissions, then rerun.`
+          );
+        }
+        this.rememberOwnedTemporaryCollection(owned);
+        return owned;
+      } catch (error) {
+        lastError = error;
+        if (
+          ambiguousCreateUnreconciled ||
+          !this.isRetryableGenerationError(error)
+        ) {
+          throw error;
+        }
+        const cleanedUpFailedAttempt = await this.cleanupFailedGenerationAttempt(specId, ownedName, preSnapshot);
+        if (!cleanedUpFailedAttempt || generationAttempt >= PostmanGatewaySmokeClient.GENERATION_MAX_ATTEMPTS) {
+          throw error;
+        }
+        const delay = this.generationRetryDelayMs(generationAttempt);
+        this.warning?.(
+          `Collection generation attempt ${generationAttempt}/${PostmanGatewaySmokeClient.GENERATION_MAX_ATTEMPTS} for spec ${specId} failed after creating and deleting a run-owned temporary collection: ${this.secretMasker(summarizeError(error))}. Retrying in ${delay}ms.`
+        );
+        await this.sleepImpl(delay);
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private buildGenerationAttemptName(prefix: string, projectName: string, generationAttempt: number): string {
+    const base = [prefix.trim(), projectName.trim(), this.runIdentity].filter(Boolean).join(' ');
+    return generationAttempt === 1 ? base : [base, `retry-${generationAttempt}`].filter(Boolean).join(' ');
+  }
+
+  private async waitForGenerationTask(specId: string, taskId: string): Promise<void> {
+    if (taskId) {
+      const startedAt = this.now();
+      for (let attempt = 0; attempt < PostmanGatewaySmokeClient.GENERATION_POLL_ATTEMPTS; attempt += 1) {
+        const fixed = process.env.POSTMAN_GENERATION_POLL_MODE === 'fixed';
+        const delay = fixed
+          ? PostmanGatewaySmokeClient.GENERATION_POLL_DELAY_MS
+          : Math.min(16000, 2000 * 2 ** attempt);
+        const remaining = PostmanGatewaySmokeClient.GENERATION_POLL_TIMEOUT_MS - (this.now() - startedAt);
+        if (remaining <= 0) {
+          throw new Error(`COLLECTION_GENERATION_TIMEOUT: Collection generation timed out for spec ${specId} task ${taskId}.`);
+        }
+        await this.sleepImpl(Math.min(delay, remaining));
+        const task = await this.gateway.requestJson<JsonRecord>({
+          service: 'specification',
+          method: 'get',
+          path: '/tasks',
+          query: { entityId: specId, entityType: 'specification', type: 'collection-generation' }
+        });
+        const status = String(asRecord(task?.data)?.[taskId] ?? '').toLowerCase();
+        if (status === 'failed' || status === 'error') {
+          this.warning?.(
+            `Collection generation task response for spec ${specId} task ${taskId}: ${this.secretMasker(JSON.stringify(task))}`
+          );
+          throw new Error(
+            `COLLECTION_GENERATION_TASK_FAILED: Collection generation task failed for spec ${specId} task ${taskId} (status=${status}). Inspect the spec generation/task state and permissions, then rerun.`
+          );
+        }
+        if (status && status !== 'in-progress' && status !== 'pending' && status !== 'queued') {
+          break;
+        }
+        if (this.now() - startedAt >= PostmanGatewaySmokeClient.GENERATION_POLL_TIMEOUT_MS || attempt === PostmanGatewaySmokeClient.GENERATION_POLL_ATTEMPTS - 1) {
+          throw new Error(
+            `COLLECTION_GENERATION_TIMEOUT: Collection generation timed out for spec ${specId} task ${taskId}. Inspect the spec generation/task state and permissions, then rerun.`
+          );
+        }
+      }
+    }
+  }
+
+  private async cleanupFailedGenerationAttempt(
+    specId: string,
+    ownedName: string,
+    preSnapshot: readonly string[]
+  ): Promise<boolean> {
+    try {
+      const reconciled = await this.reconcileGeneratedCollection(specId, ownedName, preSnapshot);
+      if (!reconciled) return false;
+      this.rememberOwnedTemporaryCollection(reconciled);
+      await this.deleteCollection(reconciled);
+      this.warning?.(`Deleted temporary Smoke collection ${reconciled} from failed generation attempt.`);
+      return true;
+    } catch (error) {
+      this.warning?.(
+        `Failed to clean up temporary Smoke collection from failed generation attempt: ${this.secretMasker(summarizeError(error))}`
+      );
+      return false;
+    }
+  }
+
+  private isRetryableGenerationError(error: unknown): boolean {
+    // Retrying is only considered after the service reports a terminal failed
+    // task; the caller also requires positive cleanup of that attempt's temp.
+    const message = summarizeError(error);
+    return message.includes('COLLECTION_GENERATION_TASK_FAILED');
+  }
+
+  private generationRetryDelayMs(generationAttempt: number): number {
+    const ceiling = Math.min(
+      PostmanGatewaySmokeClient.GENERATION_RETRY_MAX_DELAY_MS,
+      PostmanGatewaySmokeClient.GENERATION_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, generationAttempt - 1)
+    );
+    return Math.floor(Math.random() * Math.max(1, ceiling));
+  }
+
+  /** POST the generation request, retrying a 423-locked spec; returns the task id. */
+  private async postGenerationWithLockRetry(specId: string, body: unknown): Promise<string> {
+    for (let lockedAttempt = 0; ; lockedAttempt += 1) {
+      try {
+        const created = await this.gateway.requestJson<JsonRecord>({
+          service: 'specification',
+          method: 'post',
+          path: `/specifications/${specId}/collections`,
+          body,
+          // Unsafe create: never blind-retry an ambiguous accept.
+          maxRetries: 0
+        });
+        return String(asRecord(created?.data)?.taskId ?? '').trim();
+      } catch (error) {
+        const locked = error instanceof HttpError && error.status === 423;
+        if (!locked || lockedAttempt >= PostmanGatewaySmokeClient.GENERATION_LOCKED_MAX_RETRIES) {
+          throw error;
+        }
+        await this.sleepImpl(5000 * Math.pow(2, lockedAttempt));
+      }
+    }
+  }
+
+  private async listSpecCollectionUids(specId: string): Promise<string[]> {
+    const list = await this.gateway.requestJson<JsonRecord>({
+      service: 'specification',
+      method: 'get',
+      path: `/specifications/${specId}/collections`
+    });
+    const uids: string[] = [];
+    for (const entry of asArray(asRecord(list)?.data)) {
+      const uid = String(entry.collection ?? entry.collectionId ?? entry.id ?? '').trim();
+      if (uid) uids.push(uid);
+    }
+    return uids;
+  }
+
+  /**
+   * Adopt the temporary collection that matches this run's unique name, preferring
+   * IDs absent from the pre-run snapshot so peer temps are never selected.
+   */
+  private async reconcileGeneratedCollection(
+    specId: string,
+    ownedName: string,
+    preSnapshot: readonly string[]
+  ): Promise<string | null> {
+    const pre = new Set(preSnapshot);
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const listed = (await this.listSpecCollectionUids(specId)).filter((uid) => !pre.has(uid));
+      const matches: string[] = [];
+      if (listed.length > 0) {
+        const names = await this.readCollectionNames(listed);
+        for (const uid of listed) {
+          if (names.get(bareModelId(uid)) === ownedName) matches.push(uid);
+        }
+      }
+      if (matches.length === 1) return matches[0] ?? null;
+      if (matches.length > 1) {
+        throw new Error(
+          `Collection generation for spec ${specId} reconciled ambiguously for run-owned temporary name ${ownedName}: ${matches.join(', ')}. Remove the stale run-owned temporary collection(s), then rerun.`
+        );
+      }
+      if (attempt < 5) await this.sleepImpl(Math.min(2000, 250 * 2 ** attempt));
+    }
+    return null;
+  }
+
+  /**
+   * Resolve collection names for reconciliation from one workspace inventory
+   * snapshot (the only surface carrying the public uid), plus a light ROOT read
+   * for any owner-prefixed uid the inventory has not surfaced yet. Never uses
+   * Collection v3 `/export`: that projection is expensive and unstable for fresh
+   * roots. Keys are bare model ids so either uid form matches.
+   */
+  private async readCollectionNames(uids: readonly string[]): Promise<Map<string, string>> {
+    const names = new Map<string, string>();
+    if (this.workspaceId) {
+      for (const entry of await this.listWorkspaceCollectionsFor(this.workspaceId)) {
+        names.set(bareModelId(entry.id), entry.name);
+      }
+    }
+    for (const uid of uids) {
+      const key = bareModelId(uid);
+      if (names.has(key) || isBareCollectionUuid(uid)) continue;
+      try {
+        const root = await this.gateway.requestJson<JsonRecord>({
+          service: 'collection',
+          method: 'get',
+          path: `/v3/collections/${uid}`
+        });
+        const name = asRecord(root?.data)?.name;
+        if (typeof name === 'string') names.set(key, name);
+      } catch (error) {
+        if (!(error instanceof HttpError && error.status === 404)) throw error;
+      }
+    }
+    return names;
+  }
+
+  private rememberOwnedTemporaryCollection(collectionUid: string): void {
+    const trimmed = String(collectionUid ?? '').trim();
+    if (!trimmed) return;
+    this.ownedTemporaryCollectionIds.add(trimmed);
+    this.ownedTemporaryCollectionIds.add(bareModelId(trimmed));
+  }
+
+  private isOwnedTemporaryCollection(collectionUid: string): boolean {
+    const trimmed = String(collectionUid ?? '').trim();
+    if (!trimmed) return false;
+    return (
+      this.ownedTemporaryCollectionIds.has(trimmed) ||
+      this.ownedTemporaryCollectionIds.has(bareModelId(trimmed))
+    );
+  }
+
+  /**
+   * Fetch one complete v2.1 collection through a single retry-free populated
+   * Sync GET addressed by the full public uid. The snapshot must be a v2.1 model
+   * for the requested collection; malformed or foreign snapshots fail closed.
+   */
+  async getCollection(collectionUid: string): Promise<JsonRecord> {
+    const wireUid = await this.resolveWireCollectionUid(collectionUid);
+    const response = await this.gateway.requestJson<JsonRecord>({
+      service: 'sync',
+      method: 'get',
+      path: `/collection/${encodeURIComponent(wireUid)}`,
+      query: { populate: 'true', format: '2.1.0', uid: 'false' },
+      retry: 'none',
+      fallback: 'none'
+    });
+    const model = asRecord(response?.data);
+    const info = asRecord(model?.info);
+    if (!model || !info || typeof info.name !== 'string' || !Array.isArray(model.item)) {
+      throw new Error(
+        `COLLECTION_SNAPSHOT_INVALID: populated Sync read for collection ${collectionUid} did not return a v2.1 model`
+      );
+    }
+    const schema = String(info.schema ?? '');
+    if (!/collection\/v2\.1\.0\//.test(schema)) {
+      throw new Error(
+        `COLLECTION_SNAPSHOT_INVALID: collection ${collectionUid} snapshot schema ${schema || '<missing>'} is not v2.1.0`
+      );
+    }
+    const observed = String(info._postman_id ?? model.id ?? '').trim();
+    if (
+      !observed ||
+      normalizeCollectionModelIdentity(observed) !== normalizeCollectionModelIdentity(wireUid)
+    ) {
+      throw new Error(
+        `COLLECTION_SNAPSHOT_INVALID: populated Sync read for collection ${collectionUid} returned a foreign snapshot`
+      );
+    }
+    return model;
+  }
+
+  async updateCollection(collectionUid: string, collection: unknown): Promise<void> {
+    const desired = asRecord(collection);
+    if (!desired) {
+      throw new Error(`updateCollection: invalid collection payload for ${collectionUid}`);
+    }
+
+    const wireUid = await this.resolveWireCollectionUid(collectionUid);
+    await this.assertCanonicalBelongsToWorkspace(wireUid);
+    const itemsCid = collectionItemsId(wireUid);
+    const rootCid = this.collectionRootId(wireUid);
+
+    await this.reconcileItemsRecursive(itemsCid, desired.item, {
+      id: itemsCid,
+      $kind: 'collection'
+    });
+
+    // Collection-level: name, auth, variables.
+    const ops: JsonRecord[] = [];
+    const info = asRecord(desired.info);
+    const name = typeof info?.name === 'string' ? info.name : undefined;
+    if (name !== undefined) ops.push({ op: 'replace', path: '/name', value: name });
+    const desiredAuth = asRecord(desired.auth);
+    const collAuth = v2AuthToV3(desiredAuth);
+    const clearCollectionAuth = !collAuth && isNoAuth(desiredAuth);
+    if (collAuth) ops.push({ op: 'add', path: '/auth', value: collAuth });
+    if (Array.isArray(desired.variable)) {
+      const variables = desired.variable
+        .map(asRecord)
+        .filter((v): v is JsonRecord => Boolean(v))
+        .map((v) => ({ key: String(v.key ?? ''), value: v.value ?? '' }));
+      if (variables.length > 0) ops.push({ op: 'add', path: '/variables', value: variables });
+    }
+    if (ops.length > 0) {
+      await this.gateway.request({
+        service: 'collection',
+        method: 'patch',
+        path: `/v3/collections/${rootCid}`,
+        body: ops,
+        // Fixed-path add/replace operations are idempotent.
+        maxRetries: 3
+      });
+    }
+    if (clearCollectionAuth) {
+      await this.clearCollectionAuth(rootCid);
+    }
+
+    // Collection-level scripts (e.g. the OAuth token-cache pre-request) go in a
+    // separate patch. The root accepts only http:beforeRequest/http:afterRequest.
+    // A schema-shape 400 remains best-effort, but auth and server failures surface.
+    const collScripts = v2EventsToV3CollectionScripts(desired.event);
+    if (collScripts.length > 0) {
+      try {
+        await this.gateway.request({
+          service: 'collection',
+          method: 'patch',
+          path: `/v3/collections/${rootCid}`,
+          body: [{ op: 'add', path: '/scripts', value: collScripts }],
+          // Adding the same root script value is idempotent.
+          maxRetries: 3
+        });
+      } catch (error) {
+        if (!(error instanceof HttpError && error.status === 400)) throw error;
+        const cause = this.secretMasker(summarizeError(error));
+        this.warning?.(
+          `Failed collection-level runtime-script patch for collection ${collectionUid}: ${cause}. Collection update continued, but required runtime scripts may be absent; verify collection-script support/permissions for this collection/workspace, then rerun.`
+        );
+      }
+    }
+  }
+
+  private async listWorkspaceCollections(): Promise<Array<{ id: string; name: string }>> {
+    if (!this.workspaceId) return [];
+    return this.listWorkspaceCollectionsFor(this.workspaceId);
+  }
+
+  private async assertCanonicalBelongsToWorkspace(collectionUid: string): Promise<void> {
+    if (!this.workspaceId) {
+      return;
+    }
+    const collections = await this.listWorkspaceCollections();
+    const targetIdentity = normalizeCollectionModelIdentity(collectionUid);
+    const found = collections.some((entry) => {
+      const id = String(entry.id ?? '').trim();
+      return id === collectionUid || normalizeCollectionModelIdentity(id) === targetIdentity;
+    });
+    if (!found) {
+      throw new Error(
+        `Canonical collection ${collectionUid} was absent from workspace ${this.workspaceId} collection list; refusing mutate. Pass the workspace that owns the canonical collection, or the matching collection ID.`
+      );
+    }
+  }
+
+  /**
+   * Collection id for ROOT routes (`GET`/`PATCH /v3/collections/:id`). Preserve
+   * legacy non-UUID aliases, but reject a known bare UUID locally: production
+   * rejects that shape 403, so callers must resolve it through inventory first.
+   */
+  private collectionRootId(uid: string): string {
+    const id = String(uid ?? '').trim();
+    if (isBareCollectionUuid(id)) {
+      throw new Error(
+        'COLLECTION_ROOT_UID_REQUIRED: a bare collection model id cannot address Collection ROOT'
+      );
+    }
+    return id;
+  }
+
+  /**
+   * Resolve the full public uid used by ITEMS and ROOT routes. A ROOT-addressable
+   * input is returned unchanged. A bare model id is polled through workspace
+   * inventory until the owner-prefixed public uid appears.
+   */
+  private async resolveWireCollectionUid(collectionUid: string): Promise<string> {
+    const id = String(collectionUid ?? '').trim();
+    if (!id) {
+      throw new Error('COLLECTION_ROOT_UID_RESOLUTION_FAILED: collection id is required');
+    }
+    if (isFullPublicCollectionUid(id) || !isBareCollectionUuid(id)) {
+      return id;
+    }
+    if (!this.workspaceId) {
+      throw new Error(
+        'COLLECTION_ROOT_UID_RESOLUTION_FAILED: workspace-id is required to resolve a bare collection model id to a ROOT-addressable public uid'
+      );
+    }
+    const resolved = await this.resolveCollectionRootUid(
+      this.workspaceId,
+      id,
+      PostmanGatewaySmokeClient.ROOT_UID_RESOLVE_DELAYS_MS
+    );
+    if (!resolved) {
+      throw new Error(
+        'COLLECTION_ROOT_UID_RESOLUTION_FAILED: collection did not become inventory-visible with a ROOT-addressable public uid'
+      );
+    }
+    return resolved;
+  }
+
+  /**
+   * Resolve a collection's ROOT-addressable id from workspace inventory — the
+   * only surface that carries the numeric owner prefix.
+   */
+  private async resolveCollectionRootUid(
+    workspaceId: string,
+    collectionId: string,
+    delays: readonly number[]
+  ): Promise<string | undefined> {
+    const id = String(collectionId ?? '').trim();
+    if (!id) return undefined;
+    if (!isBareCollectionUuid(id)) return id;
+    const targetIdentity = normalizeCollectionModelIdentity(id);
+    for (let observation = 0; observation <= delays.length; observation += 1) {
+      try {
+        const inventory = await this.listWorkspaceCollectionsFor(workspaceId);
+        const match = inventory.find(
+          (entry) => normalizeCollectionModelIdentity(entry.id) === targetIdentity
+        );
+        if (match?.id && isFullPublicCollectionUid(match.id)) return match.id;
+      } catch {
+        // Inventory unreadable on this observation; spend the remaining budget.
+      }
+      if (observation < delays.length) await this.sleepImpl(delays[observation]!);
+    }
+    return undefined;
+  }
+
+  private async listWorkspaceCollectionsFor(
+    workspaceId: string
+  ): Promise<Array<{ id: string; name: string }>> {
+    const listed = await this.gateway.requestJson<JsonRecord>({
+      service: 'collection',
+      method: 'get',
+      path: `/v3/collections/?workspace=${encodeURIComponent(workspaceId)}`
+    });
+    return asArray(asRecord(listed)?.data ?? listed?.data)
+      .map((entry) => ({
+        id: String(entry.id ?? entry.uid ?? '').trim(),
+        name: String(entry.name ?? entry.title ?? '').trim()
+      }))
+      .filter((entry) => entry.id);
+  }
+
+  private async clearCollectionAuth(cid: string): Promise<void> {
+    try {
+      await this.gateway.request({
+        service: 'collection',
+        method: 'patch',
+        path: `/v3/collections/${cid}`,
+        body: [{ op: 'remove', path: '/auth' }],
+        // Removing auth has one end state; a repeated missing-value response is
+        // handled below as successful reconciliation.
+        maxRetries: 3
+      });
+    } catch (error) {
+      if (isMissingPatchValueError(error)) {
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async listItems(cid: string): Promise<ItemListing> {
+    const listed = await this.gateway.requestJson<JsonRecord>({
+      service: 'collection',
+      method: 'get',
+      path: `/v3/collections/${cid}/items/`
+    });
+    const entries = asArray(listed?.data);
+    const parentByChildId = new Map<string, string>();
+    for (const parent of entries) {
+      const parentId = bareModelId(String(parent.id ?? parent.uid ?? ''));
+      if (!parentId) continue;
+      for (const stub of asArray(parent.items)) {
+        const childId = bareModelId(String(stub.id ?? stub.uid ?? ''));
+        if (!childId) continue;
+        const existingParent = parentByChildId.get(childId);
+        if (existingParent && existingParent !== parentId) {
+          throw new Error(`updateCollection: item ${childId} is referenced by multiple parents`);
+        }
+        parentByChildId.set(childId, parentId);
+      }
+    }
+    return { entries, parentByChildId };
+  }
+
+  private listChildItems(listing: ItemListing, parentId: string, collectionCid: string): JsonRecord[] {
+    const parentBare = bareModelId(parentId);
+    const collectionBare = bareModelId(collectionCid);
+    const isCollectionRoot =
+      parentBare === collectionBare || parentId === collectionCid || bareModelId(parentId) === collectionBare;
+    return listing.entries.filter((item) => {
+      const itemParent = itemParentBareId(item, listing.parentByChildId);
+      if (itemParent === null) {
+        return isCollectionRoot;
+      }
+      return itemParent === parentBare || itemParent === bareModelId(parentId);
+    });
+  }
+
+  private assertUniqueNames(items: JsonRecord[], parentId: string, label: string): Map<string, JsonRecord> {
+    const byName = new Map<string, JsonRecord[]>();
+    for (const item of items) {
+      const name = String(item.name ?? '');
+      const group = byName.get(name) ?? [];
+      group.push(item);
+      byName.set(name, group);
+    }
+    for (const [name, group] of byName) {
+      if (group.length > 1) {
+        throw new Error(
+          `updateCollection: duplicate ${label} item name "${name}" under parent ${parentId}; refusing to reconcile`
+        );
+      }
+    }
+    const unique = new Map<string, JsonRecord>();
+    for (const [name, group] of byName) {
+      const only = group[0];
+      if (only) unique.set(name, only);
+    }
+    return unique;
+  }
+
+  private async reconcileItemsRecursive(cid: string, desiredItems: unknown, parent: ParentRef): Promise<void> {
+    const listing = await this.listItems(cid);
+    const siblings = this.listChildItems(listing, parent.id, cid);
+    const existingByName = this.assertUniqueNames(siblings, parent.id, 'existing');
+
+    const desiredArray = asArray(desiredItems);
+    const desiredNames = new Set<string>();
+    for (const item of desiredArray) {
+      const name = typeof item.name === 'string' ? item.name : '';
+      if (desiredNames.has(name)) {
+        throw new Error(`updateCollection: duplicate desired item name "${name}" under parent ${parent.id}`);
+      }
+      desiredNames.add(name);
+    }
+
+    for (const sibling of siblings) {
+      const name = String(sibling.name ?? '');
+      if (!desiredNames.has(name)) {
+        await this.deleteItemTolerant(cid, sibling);
+      }
+    }
+
+    const refreshed = this.listChildItems(await this.listItems(cid), parent.id, cid);
+    const remainingByName = this.assertUniqueNames(refreshed, parent.id, 'existing');
+
+    for (const item of desiredArray) {
+      const name = typeof item.name === 'string' ? item.name : '';
+      const request = asRecord(item.request);
+      if (request) {
+        const existing = remainingByName.get(name);
+        if (existing && String(existing.$kind ?? 'http-request') === 'http-request') {
+          await this.updateRequestItem(cid, existing, item, request, parent);
+          continue;
+        }
+        if (existing) {
+          await this.deleteItemTolerant(cid, existing);
+        }
+        await this.createRequestItem(cid, item, request, parent);
+        continue;
+      }
+
+      if (Array.isArray(item.item)) {
+        const existing = remainingByName.get(name) ?? existingByName.get(name);
+        if (existing && String(existing.$kind ?? '') !== 'collection') {
+          await this.deleteItemTolerant(cid, existing);
+        }
+        const folderId = existing && String(existing.$kind ?? '') === 'collection'
+          ? String(existing.id ?? '').trim()
+          : await this.createFolderItem(cid, item, parent);
+        if (!folderId) {
+          throw new Error(`updateCollection: missing folder id for ${name || '<unnamed>'}`);
+        }
+        await this.reconcileItemsRecursive(cid, item.item, { id: folderId, $kind: 'collection' });
+      }
+    }
+  }
+
+  private async deleteItemTolerant(cid: string, item: JsonRecord): Promise<void> {
+    const itemId = String(item.id ?? '').trim();
+    if (!itemId) return;
+    const kind = String(item.$kind ?? 'http-request');
+    let lastAmbiguousError: unknown;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        await this.gateway.request({
+          service: 'collection',
+          method: 'delete',
+          path: `/v3/collections/${cid}/items/${itemId}`,
+          headers: { 'X-Entity-Type': kind },
+          maxRetries: 0
+        });
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 404) return;
+        if (!isAmbiguousMutationError(error)) throw error;
+        lastAmbiguousError = error;
+      }
+      const remains = (await this.listItems(cid)).entries.some(
+        (candidate) => bareModelId(String(candidate.id ?? candidate.uid ?? '')) === bareModelId(itemId)
+      );
+      if (!remains) return;
+      if (attempt < 3) await this.sleepImpl(Math.min(2000, 250 * 2 ** attempt));
+    }
+    if (lastAmbiguousError) throw lastAmbiguousError;
+    throw new Error(`updateCollection: item ${itemId} survived delete on collection ${cid}`);
+  }
+
+  private requestCreateBody(leaf: JsonRecord, request: JsonRecord, parent: ParentRef): JsonRecord {
+    const createBody: JsonRecord = {
+      $kind: 'http-request',
+      name: typeof leaf.name === 'string' ? leaf.name : '',
+      method: typeof request.method === 'string' ? request.method : 'GET',
+      url: v2UrlToRaw(request.url),
+      headers: v2HeadersToV3(request.header),
+      position: { parent }
+    };
+    const body = v2BodyToV3(asRecord(request.body));
+    if (body) createBody.body = body;
+    const auth = v2AuthToV3(asRecord(request.auth));
+    if (auth) createBody.auth = auth;
+    return createBody;
+  }
+
+  private async updateRequestItem(
+    cid: string,
+    existing: JsonRecord,
+    leaf: JsonRecord,
+    request: JsonRecord,
+    parent: ParentRef
+  ): Promise<void> {
+    const itemId = String(existing.id ?? existing.uid ?? '').trim();
+    if (!itemId) throw new Error(`updateCollection: existing request ${String(leaf.name ?? '<unnamed>')} has no id`);
+    const desired = this.requestCreateBody(leaf, request, parent);
+    const ops: JsonRecord[] = Object.entries(desired)
+      .filter(([key]) => key !== '$kind')
+      .map(([key, value]) => ({ op: 'add', path: `/${key}`, value }));
+    for (const optional of ['body', 'auth']) {
+      if (!(optional in desired) && optional in existing) {
+        ops.push({ op: 'remove', path: `/${optional}` });
+      }
+    }
+    try {
+      await this.gateway.request({
+        service: 'collection',
+        method: 'patch',
+        path: `/v3/collections/${cid}/items/${itemId}`,
+        headers: { 'X-Entity-Type': 'http-request' },
+        body: ops,
+        // Fixed-path request updates are idempotent. Missing optional removals
+        // after an ambiguous accepted patch are reconciled below.
+        maxRetries: 3
+      });
+    } catch (error) {
+      // A retried PATCH whose first attempt actually committed fails its removes
+      // as already-applied. That 400 only proves one remove target is absent,
+      // not that the whole batch landed — read the item back and only swallow
+      // the error when every intended op's end state holds.
+      if (
+        isMissingPatchValueError(error) &&
+        ops.some((op) => op.op === 'remove') &&
+        (await this.verifyItemOpsApplied(cid, itemId, ops))
+      ) {
+        // reconciled: the committed state matches the requested ops
+      } else {
+        throw error;
+      }
+    }
+    await this.patchItemScripts(cid, itemId, v2EventsToV3Scripts(leaf.event));
+  }
+
+  /**
+   * Read a single item back and check every JSON-Patch op's intended end state.
+   * Removes must be strictly absent — that is the retried-timeout hazard this
+   * guards: the already-applied-400 only proves ONE remove target is gone, so we
+   * confirm EVERY remove landed. add/replace targets are checked for presence
+   * (not structural equality): the item write surface normalizes request fields
+   * server-side (raw url form, header shape, `position`), so the stored value is
+   * not byte-equal to the requested op value even on a correct commit — presence
+   * still detects a batch that never landed. Returns false on any read failure.
+   */
+  private async verifyItemOpsApplied(cid: string, itemId: string, ops: JsonRecord[]): Promise<boolean> {
+    let item: JsonRecord | null;
+    try {
+      const got = await this.gateway.requestJson<JsonRecord>({
+        service: 'collection',
+        method: 'get',
+        path: `/v3/collections/${cid}/items/${itemId}`,
+        headers: { 'X-Entity-Type': 'http-request' }
+      });
+      item = asRecord(got?.data) ?? asRecord(got);
+    } catch {
+      return false;
+    }
+    if (!item) return false;
+    for (const op of ops) {
+      const rawPath = String(op.path ?? '');
+      const field = rawPath.startsWith('/') ? rawPath.slice(1) : rawPath;
+      if (!field) return false;
+      const value = item[field];
+      if (op.op === 'remove') {
+        if (!(value === undefined || value === null)) return false;
+      } else if (value === undefined || value === null) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async findChildByName(cid: string, parentId: string, name: string): Promise<JsonRecord | null> {
+    const children = this.listChildItems(await this.listItems(cid), parentId, cid);
+    const matches = children.filter((item) => String(item.name ?? '') === name);
+    if (matches.length > 1) {
+      throw new Error(
+        `updateCollection: duplicate item name "${name}" under parent ${parentId} after create; refusing to adopt`
+      );
+    }
+    return matches[0] ?? null;
+  }
+
+  private async createFolderItem(cid: string, folder: JsonRecord, parent: ParentRef): Promise<string> {
+    const name = typeof folder.name === 'string' ? folder.name : '';
+    const createBody: JsonRecord = {
+      $kind: 'collection',
+      name,
+      position: { parent }
+    };
+    try {
+      const created = await this.gateway.requestJson<JsonRecord>({
+        service: 'collection',
+        method: 'post',
+        path: `/v3/collections/${cid}/items/`,
+        headers: { 'X-Entity-Type': 'folder' },
+        body: createBody,
+        maxRetries: 0
+      });
+      const data = asRecord(created?.data);
+      const folderId = String(data?.id ?? data?.uid ?? '').trim();
+      if (!folderId) {
+        throw new Error(
+          `updateCollection: gateway did not return an id for folder ${name.trim() || '<unnamed>'}`
+        );
+      }
+      return folderId;
+    } catch (error) {
+      if (!isAmbiguousCreateError(error)) {
+        throw error;
+      }
+      const adopted = await this.findChildByName(cid, parent.id, name);
+      const folderId = String(adopted?.id ?? adopted?.uid ?? '').trim();
+      if (!folderId) {
+        throw error;
+      }
+      return folderId;
+    }
+  }
+
+  private async createRequestItem(
+    cid: string,
+    leaf: JsonRecord,
+    request: JsonRecord,
+    parent: ParentRef
+  ): Promise<void> {
+    // The v3 IR item carries url/method/headers/body/auth at the ROOT (sibling
+    // fields), NOT under a `payload` wrapper — a payload wrapper is silently
+    // dropped (live-proven). Body/auth use the v3 IR shapes ({type,content} /
+    // {type,credentials}); headers are {key,value} pairs.
+    const name = typeof leaf.name === 'string' ? leaf.name : '';
+    const createBody = this.requestCreateBody(leaf, request, parent);
+
+    let newItemId: string;
+    try {
+      const created = await this.gateway.requestJson<JsonRecord>({
+        service: 'collection',
+        method: 'post',
+        path: `/v3/collections/${cid}/items/`,
+        headers: { 'X-Entity-Type': 'http-request' },
+        body: createBody,
+        maxRetries: 0
+      });
+      const data = asRecord(created?.data);
+      newItemId = String(data?.id ?? data?.uid ?? '').trim();
+    } catch (error) {
+      if (!isAmbiguousCreateError(error)) {
+        throw error;
+      }
+      const adopted = await this.findChildByName(cid, parent.id, name);
+      newItemId = String(adopted?.id ?? adopted?.uid ?? '').trim();
+      if (!newItemId) {
+        throw error;
+      }
+    }
+
+    const scripts = v2EventsToV3Scripts(leaf.event);
+    if (newItemId && scripts.length > 0) {
+      await this.patchItemScripts(cid, newItemId, scripts);
+    }
+  }
+
+  /**
+   * PATCH a freshly-created item's `/scripts`, tolerating the two transient
+   * failures this immediate-after-create write is prone to on the shared gateway:
+   *   - `404 RESOURCE_NOT_FOUND` — the create write returns the assigned id, but
+   *     an immediate PATCH can hit a replica that has not yet observed the create
+   *     (read-after-write lag, live-observed on org-mode teams).
+   *   - a downstream `5xx` (e.g. `500 ESOCKETTIMEDOUT`) — a Bifrost/gateway read
+   *     timeout, not a durable rejection.
+   * `op:add /scripts` is idempotent (overwrites), so retrying either is safe.
+   * This is a deeper, longer-backoff budget than the gateway client's inner
+   * transient retry, to wait out a longer platform hiccup on this fragile write.
+   * Non-transient errors (e.g. 4xx schema rejections) surface immediately.
+   */
+  private async patchItemScripts(cid: string, itemId: string, scripts: JsonRecord[]): Promise<void> {
+    const maxAttempts = 6;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        await this.gateway.request({
+          service: 'collection',
+          method: 'patch',
+          path: `/v3/collections/${cid}/items/${itemId}`,
+          headers: { 'X-Entity-Type': 'http-request' },
+          body: [{ op: 'add', path: '/scripts', value: scripts }],
+          maxRetries: 0
+        });
+        return;
+      } catch (error) {
+        const retriable = error instanceof HttpError && (error.status === 404 || error.status >= 500);
+        if (!retriable || attempt === maxAttempts - 1) {
+          throw error;
+        }
+        await this.sleepImpl(Math.min(2000, 300 * 2 ** attempt));
+      }
+    }
+  }
+
+  async deleteCollection(collectionUid: string): Promise<void> {
+    if (this.runIdentity || this.ownedTemporaryCollectionIds.size > 0) {
+      if (!this.isOwnedTemporaryCollection(collectionUid)) {
+        throw new Error(
+          `refusing to delete collection ${collectionUid}: not positively owned by this run`
+        );
+      }
+    }
+
+    const cid = bareModelId(collectionUid);
+    try {
+      await this.gateway.request({
+        service: 'collection',
+        method: 'delete',
+        path: `/v3/collections/${cid}`,
+        maxRetries: 0
+      });
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) {
+        return;
+      }
+      if (!isAmbiguousMutationError(error)) throw error;
+      // Ambiguous outcome: prove absence from workspace inventory rather than
+      // re-projecting the collection through the unstable v3 export route.
+      if (this.workspaceId) {
+        const target = normalizeCollectionModelIdentity(collectionUid);
+        const inventory = await this.listWorkspaceCollectionsFor(this.workspaceId);
+        if (!inventory.some((entry) => normalizeCollectionModelIdentity(entry.id) === target)) {
+          return;
+        }
+      }
+      throw error;
+    }
+  }
+}
